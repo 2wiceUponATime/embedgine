@@ -1,0 +1,16 @@
+[package]
+name = "embedgine-build"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+convert_case = "0.12.0"
+embedgine-formats = { version = "0.1.0", path = "../embedgine-formats" }
+image = "0.25.10"
+prettyplease = "0.3.0"
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = "3.0.9"
+thiserror = "2.0.21"
+walkdir = "2.5.0"
