@@ -1,0 +1,11 @@
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embedgine = { version = "0.1.0", path = "..", features = ["alloc"] }
+
+[build-dependencies]
+embedgine-build = { version = "0.1.0", path = "../embedgine-build" }
+embedgine-formats = { version = "0.1.0", path = "../embedgine-formats" }

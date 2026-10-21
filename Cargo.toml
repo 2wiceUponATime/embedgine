@@ -11,7 +11,7 @@ embedgine-formats = { version = "0.1.0", path = "embedgine-formats" }
 
 [workspace]
 resolver = "3"
-members = ["embedgine-build", "embedgine-formats"]
+members = ["demo", "embedgine-build", "embedgine-formats"]
 
 [build-dependencies]
 embedgine-build = { version = "0.1.0", path = "embedgine-build" }

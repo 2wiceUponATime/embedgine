@@ -2,6 +2,10 @@
 
 use core::fmt::{Debug, Display};
 
+mod sealed {
+    pub trait Sealed {}
+}
+
 macro_rules! impl_fmt_tuple {
     ($ty:ident => $name:ident ( $($field:ident),* $(,)? )) => {
         impl Debug for $ty {
@@ -29,13 +33,73 @@ macro_rules! impl_fmt_tuple {
     }
 }
 
+macro_rules! alpha {
+    ($($name:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+        #[repr(u8)]
+        pub enum Alpha {
+            #[default]
+            $($name),+
+        }
+
+        pub trait AlphaKind: sealed::Sealed {
+            const KIND: Alpha;
+        }
+
+        $(
+            pub struct $name;
+
+            impl sealed::Sealed for $name {}
+            impl AlphaKind for $name {
+                const KIND: Alpha = Alpha::$name;
+            }
+        )+
+    };
+}
+
+alpha!(Opaque, Masked, Blended);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum SpanKind {
+    Opaque,
+    Transparent,
+    Blended,
+}
+
+impl SpanKind {
+    pub fn from_alpha(alpha: u8) -> Self {
+        match alpha {
+            255 => Self::Opaque,
+            0 => Self::Transparent,
+            _ => Self::Blended,
+        }
+    }
+}
+
+impl From<SpanKind> for Alpha {
+    fn from(value: SpanKind) -> Self {
+        match value {
+            SpanKind::Opaque => Self::Opaque,
+            SpanKind::Transparent => Self::Masked,
+            SpanKind::Blended => Self::Blended,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Span {
+    pub len: u16,
+    pub kind: SpanKind,
+}
+
 #[derive(Clone, Copy, Default, PartialEq)]
 #[repr(C)]
 pub struct Rgba8 {
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
 }
 
 impl Rgba8 {
@@ -59,9 +123,9 @@ pub trait Pixel: Debug + Display + Copy + Default + bytemuck::Pod + From<Rgba8> 
 )]
 #[repr(C)]
 pub struct Rgb888 {
-    r: u8,
-    b: u8,
-    g: u8,
+    pub r: u8,
+    pub b: u8,
+    pub g: u8,
 }
 
 impl_fmt_tuple!(Rgb888 => rgb888(r, g, b));

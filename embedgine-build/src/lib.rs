@@ -9,7 +9,7 @@ use std::{
 };
 
 use convert_case::{Case, Casing};
-use embedgine_formats::{Pixel, Rgba8};
+use embedgine_formats::{Alpha, Pixel, Rgba8, Span, SpanKind};
 use image::{GenericImageView, ImageError, ImageReader, Pixel as _};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -40,9 +40,13 @@ impl From<io::Error> for Error {
 #[derive(Debug)]
 enum EntryKind {
     Image {
-        path: PathBuf,
+        px_path: PathBuf,
+        alpha_path: Option<PathBuf>,
         width: u32,
         height: u32,
+        pixels_len: usize,
+        alphas_len: usize,
+        spans: Vec<Span>,
     },
     Module(Module),
 }
@@ -77,19 +81,44 @@ impl Module {
         self.entries.iter().map(|(name, entry)| {
             let name = format_ident!("{name}");
             match &entry.kind {
-                EntryKind::Image { path, width, height } => {
-                    let len = *width as usize * *height as usize;
-                    let path = path.to_str().unwrap();
+                EntryKind::Image { px_path, alpha_path, width, height, pixels_len, alphas_len, spans } => {
+                    let px_path = px_path.to_str().unwrap();
+                    let spans = spans
+                        .iter()
+                        .map(|&Span { len, kind }| {
+                            let kind = format_ident!("{kind:?}");
+                            quote! {
+                                embedgine::formats::Span {
+                                    len: #len,
+                                    kind: embedgine::formats::SpanKind::#kind,
+                                }
+                            }
+                        });
+                    let alpha_path = match alpha_path {
+                        Some(path) => {
+                            let path = path.to_str().unwrap();
+                            quote! {{
+                                const DATA: &Aligned<embedgine::formats::Span, [u8; #alphas_len]> = &Aligned {
+                                    _align: [],
+                                    bytes: *include_bytes!(#path),
+                                };
+                                unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #alphas_len) }
+                            }}
+                        }
+                        None => quote! { &[] }
+                    };
                     quote! {
                         pub const #name: embedgine::Image<Px, &'static [Px]> = {
-                            const DATA: &Aligned<Px, [u8; #len * std::mem::size_of::<Px>()]> = &Aligned {
+                            const DATA: &Aligned<Px, [u8; #pixels_len * std::mem::size_of::<Px>()]> = &Aligned {
                                 _align: [],
-                                bytes: *include_bytes!(#path)
+                                bytes: *include_bytes!(#px_path)
                             };
                             embedgine::Image::new(
                                 #width,
                                 #height,
-                                unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #len) }
+                                unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #pixels_len) },
+                                #alpha_path,
+                                &[#(#spans),*],
                             )
                         };
                     }
@@ -217,16 +246,34 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
             .decode()
             .map_err(|e| Error::Image(entry.path().to_path_buf(), e))?;
         let (width, height) = image.dimensions();
-        let mut pixels =
-            Vec::with_capacity(width as usize * height as usize * std::mem::size_of::<Px>());
+        let pixel_count = width as usize * height as usize;
+        let mut pixels = Vec::with_capacity(pixel_count);
+        let mut alphas = Vec::with_capacity(pixel_count);
+        let mut alpha_kind = Alpha::Opaque;
+        let mut spans: Vec<Span> = Vec::new();
         for y in 0..height {
             for x in 0..width {
-                let pixel = Px::from(Rgba8::from_values(image.get_pixel(x, y).to_rgba().0));
-                pixels.push(pixel);
+                let color = Rgba8::from_values(image.get_pixel(x, y).to_rgba().0);
+                let kind = SpanKind::from_alpha(color.a);
+                let alpha: Alpha = kind.into();
+                alpha_kind = alpha_kind.max(alpha);
+                if x == 0 || spans.last().is_none_or(|s| Alpha::from(s.kind) != alpha) {
+                    spans.push(Span { len: 0, kind });
+                }
+                let span = spans.last_mut().unwrap();
+                span.len += 1;
+                if kind == SpanKind::Blended {
+                    alphas.push(color.a);
+                }
+                if kind != SpanKind::Transparent {
+                    pixels.push(Px::from(color));
+                }
             }
         }
+        println!("cargo::warning={spans:?}");
         let relative_path = entry.path().strip_prefix(&assets_path).unwrap();
-        let out_path = out_dir.join(relative_path).with_extension("bin");
+        let base_out_path = out_dir.join(relative_path);
+        let px_path = base_out_path.with_extension("px.bin");
         let mut dirs = relative_path
             .components()
             .filter_map(|c| match c {
@@ -252,18 +299,29 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
             });
         }
         let stem = utf8(entry.path().file_stem().unwrap(), entry.path())?;
-        if let Some(parent) = out_path.parent() {
+        if let Some(parent) = px_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&out_path, bytemuck::cast_slice(&pixels))?;
+        fs::write(&px_path, bytemuck::cast_slice(&pixels))?;
+        let alpha_path = if !alphas.is_empty() {
+            let path = base_out_path.with_extension("alpha.bin");
+            fs::write(&path, &alphas)?;
+            Some(path)
+        } else {
+            None
+        };
         stack.last_mut().unwrap().module.insert(
             stem.to_case(Case::UpperSnake),
             Entry::new(
                 entry.path().to_path_buf(),
                 EntryKind::Image {
-                    path: out_path,
+                    px_path,
+                    alpha_path,
                     width,
                     height,
+                    pixels_len: pixels.len(),
+                    alphas_len: alphas.len(),
+                    spans,
                 },
             ),
         )?;
