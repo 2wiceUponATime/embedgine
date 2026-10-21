@@ -45,7 +45,6 @@ enum EntryKind {
         width: u32,
         height: u32,
         pixels_len: usize,
-        alphas_len: usize,
         spans: Vec<Span>,
     },
     Module(Module),
@@ -81,7 +80,7 @@ impl Module {
         self.entries.iter().map(|(name, entry)| {
             let name = format_ident!("{name}");
             match &entry.kind {
-                EntryKind::Image { px_path, alpha_path, width, height, pixels_len, alphas_len, spans } => {
+                EntryKind::Image { px_path, alpha_path, width, height, pixels_len, spans } => {
                     let px_path = px_path.to_str().unwrap();
                     let spans = spans
                         .iter()
@@ -97,13 +96,7 @@ impl Module {
                     let alpha_path = match alpha_path {
                         Some(path) => {
                             let path = path.to_str().unwrap();
-                            quote! {{
-                                const DATA: &Aligned<embedgine::formats::Span, [u8; #alphas_len]> = &Aligned {
-                                    _align: [],
-                                    bytes: *include_bytes!(#path),
-                                };
-                                unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #alphas_len) }
-                            }}
+                            quote! { include_bytes!(#path) }
                         }
                         None => quote! { &[] }
                     };
@@ -320,7 +313,6 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
                     width,
                     height,
                     pixels_len: pixels.len(),
-                    alphas_len: alphas.len(),
                     spans,
                 },
             ),
