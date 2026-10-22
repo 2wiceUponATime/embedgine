@@ -5,3 +5,9 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
+embedded-graphics = { version = "0.8.2", optional = true }
+pastey = "0.2.3"
+
+[features]
+default = ["embedded-graphics"]
+embedded-graphics = ["dep:embedded-graphics"]

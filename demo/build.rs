@@ -1,8 +1,8 @@
 use embedgine_build::build;
-use embedgine_formats::Rgb888;
+use embedgine_formats::Rgb565Le as Px;
 
 fn main() {
-    if let Err(e) = build::<Rgb888>("assets") {
+    if let Err(e) = build::<Px>("assets") {
         panic!("{e}");
     }
 }

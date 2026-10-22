@@ -4,10 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["embedded-graphics"]
 alloc = []
+embedded-graphics = [
+  "dep:embedded-graphics",
+  "embedgine-formats/embedded-graphics",
+]
 
 [dependencies]
-embedgine-formats = { version = "0.1.0", path = "embedgine-formats" }
+embedded-graphics = { version = "0.8.2", optional = true }
+embedgine-formats = { version = "0.1.0", path = "embedgine-formats", default-features = false }
+pastey = "0.2.3"
 
 [workspace]
 resolver = "3"

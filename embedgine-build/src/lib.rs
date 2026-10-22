@@ -42,6 +42,7 @@ enum EntryKind {
     Image {
         px_path: PathBuf,
         alpha_path: Option<PathBuf>,
+        alpha: Alpha,
         width: u32,
         height: u32,
         pixels_len: usize,
@@ -80,7 +81,7 @@ impl Module {
         self.entries.iter().map(|(name, entry)| {
             let name = format_ident!("{name}");
             match &entry.kind {
-                EntryKind::Image { px_path, alpha_path, width, height, pixels_len, spans } => {
+                EntryKind::Image { px_path, alpha_path, alpha, width, height, pixels_len, spans } => {
                     let px_path = px_path.to_str().unwrap();
                     let spans = spans
                         .iter()
@@ -100,8 +101,9 @@ impl Module {
                         }
                         None => quote! { &[] }
                     };
+                    let alpha = format_ident!("{alpha:?}");
                     quote! {
-                        pub const #name: embedgine::Image<Px, &'static [Px]> = {
+                        pub const #name: embedgine::Image<Px, embedgine::formats::#alpha> = {
                             const DATA: &Aligned<Px, [u8; #pixels_len * std::mem::size_of::<Px>()]> = &Aligned {
                                 _align: [],
                                 bytes: *include_bytes!(#px_path)
@@ -259,11 +261,10 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
                     alphas.push(color.a);
                 }
                 if kind != SpanKind::Transparent {
-                    pixels.push(Px::from(color));
+                    pixels.push(Px::from(color.into()));
                 }
             }
         }
-        println!("cargo::warning={spans:?}");
         let relative_path = entry.path().strip_prefix(&assets_path).unwrap();
         let base_out_path = out_dir.join(relative_path);
         let px_path = base_out_path.with_extension("px.bin");
@@ -310,6 +311,7 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
                 EntryKind::Image {
                     px_path,
                     alpha_path,
+                    alpha: alpha_kind,
                     width,
                     height,
                     pixels_len: pixels.len(),
