@@ -43,10 +43,10 @@ enum EntryKind {
         px_path: PathBuf,
         alpha_path: Option<PathBuf>,
         alpha: Alpha,
-        width: u32,
-        height: u32,
+        width: u16,
         pixels_len: usize,
         spans: Vec<Span>,
+        row_starts: Vec<u16>,
     },
     Module(Module),
 }
@@ -81,7 +81,8 @@ impl Module {
         self.entries.iter().map(|(name, entry)| {
             let name = format_ident!("{name}");
             match &entry.kind {
-                EntryKind::Image { px_path, alpha_path, alpha, width, height, pixels_len, spans } => {
+                EntryKind::Image { px_path, alpha_path, alpha, width, row_starts, pixels_len, spans } => {
+                    let row_starts: &[u16] = if *alpha == Alpha::Opaque { &[] } else { row_starts };
                     let px_path = px_path.to_str().unwrap();
                     let spans = spans
                         .iter()
@@ -103,17 +104,17 @@ impl Module {
                     };
                     let alpha = format_ident!("{alpha:?}");
                     quote! {
-                        pub const #name: embedgine::Image<Px, embedgine::formats::#alpha> = {
+                        pub const #name: embedgine::Image<'static, Px, embedgine::formats::#alpha> = {
                             const DATA: &Aligned<Px, [u8; #pixels_len * std::mem::size_of::<Px>()]> = &Aligned {
                                 _align: [],
                                 bytes: *include_bytes!(#px_path)
                             };
                             embedgine::Image::new(
                                 #width,
-                                #height,
                                 unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #pixels_len) },
                                 #alpha_path,
                                 &[#(#spans),*],
+                                &[#(#row_starts),*],
                             )
                         };
                     }
@@ -246,12 +247,16 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
         let mut alphas = Vec::with_capacity(pixel_count);
         let mut alpha_kind = Alpha::Opaque;
         let mut spans: Vec<Span> = Vec::new();
+        let mut row_starts = Vec::new();
         for y in 0..height {
             for x in 0..width {
                 let color = Rgba8::from_values(image.get_pixel(x, y).to_rgba().0);
                 let kind = SpanKind::from_alpha(color.a);
                 let alpha: Alpha = kind.into();
                 alpha_kind = alpha_kind.max(alpha);
+                if x == 0 {
+                    row_starts.push(spans.len() as u16);
+                }
                 if x == 0 || spans.last().is_none_or(|s| Alpha::from(s.kind) != alpha) {
                     spans.push(Span { len: 0, kind });
                 }
@@ -312,10 +317,10 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
                     px_path,
                     alpha_path,
                     alpha: alpha_kind,
-                    width,
-                    height,
+                    width: width as u16,
                     pixels_len: pixels.len(),
                     spans,
+                    row_starts,
                 },
             ),
         )?;

@@ -65,6 +65,7 @@ int_widths!(
     W32(i32, u32),
     W64(i64, u64),
     W128(i128, u128),
+    WSize(isize, usize),
 );
 
 macro_rules! impl_vec2_ops {

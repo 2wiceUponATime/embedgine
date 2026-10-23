@@ -11,8 +11,7 @@ use core::{
 #[cfg(feature = "embedded-graphics")]
 use embedded_graphics::draw_target::DrawTarget;
 pub use embedgine_formats as formats;
-use embedgine_formats::AlphaKind;
-use formats::{Pixel, Span};
+use formats::{Alpha, AlphaKind, Pixel, Span};
 
 use crate::geometry::URect;
 #[cfg(feature = "embedded-graphics")]
@@ -30,34 +29,46 @@ macro_rules! include_assets {
 
 #[derive(Debug)]
 pub struct Image<'a, Px, K> {
-    width: u32,
-    height: u32,
+    width: u16,
     pixels: &'a [Px],
     alphas: &'a [u8],
     spans: &'a [Span],
+    row_starts: &'a [u16],
     _k: PhantomData<fn() -> K>,
 }
 
 impl<'a, Px, K: AlphaKind> Image<'a, Px, K> {
     pub const fn new(
-        width: u32,
-        height: u32,
+        width: u16,
         pixels: &'a [Px],
         alphas: &'a [u8],
         spans: &'a [Span],
+        row_starts: &'a [u16],
     ) -> Self {
         Self {
             width,
-            height,
             pixels,
             alphas,
             spans,
+            row_starts,
             _k: PhantomData,
         }
     }
 
     pub fn pixels(&self) -> &[Px] {
         self.pixels
+    }
+
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    pub fn height(&self) -> u16 {
+        if K::KIND == Alpha::Opaque {
+            self.spans.len() as u16
+        } else {
+            self.row_starts.len() as u16
+        }
     }
 }
 
@@ -188,21 +199,29 @@ impl<Px, B> Renderer<Px, B> {
     where
         B: AsRef<[Px]>,
     {
+        let size = self.size;
         let mut canvas_idx = 0;
-        for band in Self::bands(self.height(), self.band_height) {
-            let canvas = &mut self.buffers[canvas_idx];
-            canvas.band = band.clone();
-            draw.draw(canvas);
-            sink.present(
-                self.size,
+        let [mut drawing, mut presenting] = self.buffers.each_mut();
+        let mut pending = None;
+        for band in Self::bands(size.y, self.band_height) {
+            drawing.band = band.clone();
+            draw.draw(drawing);
+            if let Some(f) = { pending } {
+                f.await?;
+            }
+            core::mem::swap(&mut drawing, &mut presenting);
+            pending = Some(sink.present(
+                size,
                 URect::new(
                     Vec2::new(0, band.start),
-                    Vec2::new(self.width(), band.len() as u16),
+                    Vec2::new(size.x, band.len() as u16),
                 ),
-                &self.buffers[canvas_idx],
-            )
-            .await?;
+                presenting,
+            ));
             canvas_idx = (canvas_idx + 1) % 2;
+        }
+        if let Some(f) = pending {
+            f.await?;
         }
         Ok(())
     }
@@ -227,6 +246,17 @@ impl<Px: Clone + Default> Renderer<Px, alloc::vec::Vec<Px>> {
     }
 }
 
+fn map_range<T, U>(range: &Range<T>, mut f: impl FnMut(&T) -> U) -> Range<U> {
+    f(&range.start)..f(&range.end)
+}
+
+fn intersect_ranges<T: Ord>(a: Range<T>, b: Range<T>) -> Option<Range<T>> {
+    let start = a.start.max(b.start);
+    let end = a.end.min(b.end);
+
+    if start < end { Some(start..end) } else { None }
+}
+
 pub struct Canvas<Px, B> {
     size: Vec2<u16>,
     band: Range<u16>,
@@ -244,6 +274,18 @@ impl<Px, B> Canvas<Px, B> {
         }
     }
 
+    pub fn width(&self) -> u16 {
+        self.size.x
+    }
+
+    pub fn height(&self) -> u16 {
+        self.size.y
+    }
+
+    pub fn size(&self) -> Vec2<u16> {
+        self.size
+    }
+
     pub fn full(size: Vec2<u16>, buffer: B) -> Self {
         Self::new(size, 0..size.y, buffer)
     }
@@ -255,13 +297,48 @@ impl<Px, B> Canvas<Px, B> {
     fn buffer_index(&self, Vec2 { x, y }: Vec2<u16>) -> usize {
         (y - self.band.start) as usize * self.size.x as usize + x as usize
     }
+}
 
-    pub fn fill(&mut self, color: Px)
-    where
-        Px: Clone,
-        B: AsMut<[Px]>,
-    {
+impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
+    pub fn fill(&mut self, color: Px) {
         self.buffer.as_mut().fill(color);
+    }
+
+    pub fn draw_image<K: AlphaKind>(&mut self, image: &Image<'_, Px, K>, pos: Vec2<i16>) {
+        match K::KIND {
+            Alpha::Opaque => {
+                let Some(x_range) =
+                    intersect_ranges(0..self.width() as i16, pos.x..pos.x + image.width as i16)
+                else {
+                    return;
+                };
+                let Some(y_range) = intersect_ranges(
+                    map_range(&self.band, |v| *v as i16),
+                    pos.y..pos.y + image.height() as i16,
+                ) else {
+                    return;
+                };
+                let x_range = map_range(&x_range, |&v| v as u16);
+                let y_range = map_range(&y_range, |&v| v as u16);
+                let rel_x_range = map_range(&x_range, |&v| (v as i16 - pos.x) as usize);
+                let rel_y_range = map_range(&y_range, |&v| (v as i16 - pos.y) as usize);
+                let mut i = image.width as u32 * rel_y_range.start as u32;
+                for (y, span) in image.spans[rel_y_range.start..].iter().enumerate() {
+                    let y = y_range.start + y as u16;
+                    if y >= y_range.end {
+                        break;
+                    }
+                    let start = i;
+                    i += span.len as u32;
+                    let row = &image.pixels[start as usize..i as usize][rel_x_range.clone()];
+                    let buffer_index = self.buffer_index(Vec2::new(x_range.start, y));
+                    self.buffer.as_mut()[buffer_index..buffer_index + x_range.len()]
+                        .copy_from_slice(row);
+                }
+            }
+            Alpha::Masked => todo!(),
+            Alpha::Blended => todo!(),
+        }
     }
 }
 
