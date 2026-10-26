@@ -95,7 +95,7 @@ impl Module {
                                 }
                             }
                         });
-                    let alpha_path = match alpha_path {
+                    let alphas = match alpha_path {
                         Some(path) => {
                             let path = path.to_str().unwrap();
                             quote! { include_bytes!(#path) }
@@ -112,7 +112,7 @@ impl Module {
                             embedgine::Image::new(
                                 #width,
                                 unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #pixels_len) },
-                                #alpha_path,
+                                #alphas,
                                 &[#(#spans),*],
                                 &[#(#row_starts),*],
                             )

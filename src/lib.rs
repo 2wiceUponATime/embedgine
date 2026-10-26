@@ -5,7 +5,7 @@ extern crate alloc;
 
 use core::{
     marker::PhantomData,
-    ops::{Index, IndexMut, Range},
+    ops::{BitAnd, BitOr, BitXor, Index, IndexMut, Not, Range, Sub},
 };
 
 #[cfg(feature = "embedded-graphics")]
@@ -69,6 +69,10 @@ impl<'a, Px, K: AlphaKind> Image<'a, Px, K> {
         } else {
             self.row_starts.len() as u16
         }
+    }
+
+    pub fn size(&self) -> Vec2<u16> {
+        Vec2::new(self.width(), self.height())
     }
 }
 
@@ -250,6 +254,10 @@ fn map_range<T, U>(range: &Range<T>, mut f: impl FnMut(&T) -> U) -> Range<U> {
     f(&range.start)..f(&range.end)
 }
 
+fn mirror_range<T: Copy + Sub>(range: &Range<T>, axis: T) -> Range<<T as Sub>::Output> {
+    axis - range.end..axis - range.start
+}
+
 fn intersect_ranges<T: Ord>(a: Range<T>, b: Range<T>) -> Option<Range<T>> {
     let start = a.start.max(b.start);
     let end = a.end.min(b.end);
@@ -304,36 +312,83 @@ impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
         self.buffer.as_mut().fill(color);
     }
 
-    pub fn draw_image<K: AlphaKind>(&mut self, image: &Image<'_, Px, K>, pos: Vec2<i16>) {
+    pub fn draw_image<K: AlphaKind>(
+        &mut self,
+        image: &Image<'_, Px, K>,
+        pos: Vec2<i16>,
+        transform: Transform,
+    ) {
+        let (width, height) = image.size().as_tuple();
+        let (out_width, out_height) = transform.swap_if_transposed(width, height);
+        let (step, flipped) = if transform.is_transposed() {
+            (self.width() as i16, transform.is_flipped_y())
+        } else {
+            (1, transform.is_flipped_x())
+        };
+        let stride = if flipped { -step } else { step };
         match K::KIND {
             Alpha::Opaque => {
-                let Some(x_range) =
-                    intersect_ranges(0..self.width() as i16, pos.x..pos.x + image.width as i16)
+                let Some(out_x) =
+                    intersect_ranges(0..self.width() as i16, pos.x..pos.x + out_width as i16)
                 else {
                     return;
                 };
-                let Some(y_range) = intersect_ranges(
-                    map_range(&self.band, |v| *v as i16),
-                    pos.y..pos.y + image.height() as i16,
+                let Some(out_y) = intersect_ranges(
+                    map_range(&self.band, |&v| v as i16),
+                    pos.y..pos.y + out_height as i16,
                 ) else {
                     return;
                 };
-                let x_range = map_range(&x_range, |&v| v as u16);
-                let y_range = map_range(&y_range, |&v| v as u16);
-                let rel_x_range = map_range(&x_range, |&v| (v as i16 - pos.x) as usize);
-                let rel_y_range = map_range(&y_range, |&v| (v as i16 - pos.y) as usize);
-                let mut i = image.width as u32 * rel_y_range.start as u32;
-                for (y, span) in image.spans[rel_y_range.start..].iter().enumerate() {
-                    let y = y_range.start + y as u16;
-                    if y >= y_range.end {
-                        break;
+                let (mut in_x, mut in_y) = transform.swap_if_transposed(
+                    map_range(&out_x, |&v| v - pos.x),
+                    map_range(&out_y, |&v| v - pos.y),
+                );
+                let (in_flip_x, in_flip_y) = transform
+                    .swap_if_transposed(transform.is_flipped_x(), transform.is_flipped_y());
+                if in_flip_x {
+                    in_x = mirror_range(&in_x, image.width as i16);
+                }
+                if in_flip_y {
+                    in_y = mirror_range(&in_y, image.height() as i16);
+                }
+                let mut i = in_y.start as u32 * image.width as u32;
+                for (y, span) in image.spans[in_y.start as usize..in_y.end as usize]
+                    .iter()
+                    .enumerate()
+                {
+                    let (mut x, mut y) = transform.swap_if_transposed(0, y as u16);
+                    if transform.is_flipped_x() {
+                        x = out_x.len() as u16 - 1 - x;
                     }
+                    if transform.is_flipped_y() {
+                        y = out_y.len() as u16 - 1 - y;
+                    }
+                    x += out_x.start as u16;
+                    y += out_y.start as u16;
                     let start = i;
                     i += span.len as u32;
-                    let row = &image.pixels[start as usize..i as usize][rel_x_range.clone()];
-                    let buffer_index = self.buffer_index(Vec2::new(x_range.start, y));
-                    self.buffer.as_mut()[buffer_index..buffer_index + x_range.len()]
-                        .copy_from_slice(row);
+                    let row_range = map_range(&in_x, |&v| v as usize);
+                    let src = &image.pixels[start as usize..i as usize][row_range];
+                    let mut start = self.buffer_index(Vec2::new(x, y));
+                    let buf = self.buffer.as_mut();
+                    match stride {
+                        1 => buf[start..start + src.len()].copy_from_slice(src),
+                        -1 => {
+                            let dest = &mut buf[start + 1 - src.len()..];
+                            for (d, &s) in dest.iter_mut().zip(src) {
+                                *d = s;
+                            }
+                        }
+                        mut s => {
+                            if s < 0 {
+                                s = -s;
+                                start -= (src.len() - 1) * s as usize;
+                            }
+                            for (d, &s) in buf[start..].iter_mut().step_by(s as usize).zip(src) {
+                                *d = s;
+                            }
+                        }
+                    }
                 }
             }
             Alpha::Masked => todo!(),
@@ -354,5 +409,87 @@ impl<Px, B: AsRef<[Px]> + AsMut<[Px]>> IndexMut<Vec2<u16>> for Canvas<Px, B> {
     fn index_mut(&mut self, pos: Vec2<u16>) -> &mut Self::Output {
         let i = self.buffer_index(pos);
         &mut self.buffer.as_mut()[i]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Transform {
+    // Bits (most to least significant): flip x, flip y, transpose (swap x and y)
+    Identity = 0b000,
+    Transpose = 0b001,
+    FlipY = 0b010,
+    RotCcw = 0b011,
+    FlipX = 0b100,
+    RotCw = 0b101,
+    Rot180 = 0b110,
+    Transverse = 0b111,
+}
+
+impl Transform {
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            0b000 => Self::Identity,
+            0b001 => Self::Transpose,
+            0b010 => Self::FlipY,
+            0b011 => Self::RotCcw,
+            0b100 => Self::FlipX,
+            0b101 => Self::RotCw,
+            0b110 => Self::Rot180,
+            0b111 => Self::Transverse,
+            _ => unreachable!(),
+        }
+    }
+
+    pub const fn from_bits(flip_x: bool, flip_y: bool, transpose: bool) -> Self {
+        Self::from_u8((flip_x as u8) << 2 | (flip_y as u8) << 1 | transpose as u8)
+    }
+
+    pub const fn is_flipped_x(self) -> bool {
+        self as u8 & 0b100 != 0
+    }
+
+    pub const fn is_flipped_y(self) -> bool {
+        self as u8 & 0b010 != 0
+    }
+
+    pub const fn is_transposed(self) -> bool {
+        self as u8 & 0b001 != 0
+    }
+
+    pub const fn swap_if_transposed<T>(self, a: T, b: T) -> (T, T) {
+        if self.is_transposed() { (b, a) } else { (a, b) }
+    }
+}
+
+macro_rules! impl_transform_bit_ops {
+    ($($op:ident),+ $(,)?) => {
+        $(pastey::paste! {
+            impl core::ops::$op for Transform {
+                type Output = Self;
+
+                #[inline]
+                fn [<$op:lower>](self, other: Self) -> Self {
+                    Self::from_u8((self as u8).[<$op:lower>](other as u8))
+                }
+            }
+
+            impl core::ops::[<$op Assign>] for Transform {
+                #[inline]
+                fn [<$op:lower _assign>](&mut self, other: Self) {
+                    *self = self.[<$op:lower>](other);
+                }
+            }
+        })*
+    };
+}
+
+impl_transform_bit_ops!(BitAnd, BitOr, BitXor);
+
+impl Not for Transform {
+    type Output = Self;
+
+    fn not(self) -> Self {
+        Self::from_u8(!(self as u8) & 0b111)
     }
 }
