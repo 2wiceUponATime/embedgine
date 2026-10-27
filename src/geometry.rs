@@ -1,8 +1,3 @@
-use core::{
-    num::TryFromIntError,
-    ops::{Add, Mul, Sub},
-};
-
 #[cfg(feature = "embedded-graphics")]
 use embedded_graphics::{
     geometry::{Point, Size},
@@ -27,8 +22,8 @@ scalars!(
 macro_rules! int_widths {
     ($($ty:ident($signed:ident, $unsigned:ident $(,)?)),+ $(,)?) => {
         pub trait IntWidth: private::Sealed {
-            type Signed: TryFrom<Self::Unsigned, Error = TryFromIntError> + Copy;
-            type Unsigned: TryFrom<Self::Signed, Error = TryFromIntError> + Copy;
+            int_widths!(@ty Signed);
+            int_widths!(@ty Unsigned);
 
             const SIGNED_MAX: Self::Signed;
 
@@ -57,6 +52,13 @@ macro_rules! int_widths {
             }
         )+
     };
+    (@ty $name:ident) => {
+        //type $name: Copy + Add<Output = Self::$name> + Sub<Output = Self::$name>;
+        int_widths!(@ty $name, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, Not);
+    };
+    (@ty $name:ident, $($trait:ident),+) => {
+        type $name: $(core::ops::$trait<Output = Self::$name> +)+ Copy + Ord;
+    }
 }
 
 int_widths!(
@@ -258,14 +260,10 @@ impl<T: IntWidth> Rect<T> {
         Self { pos, size }
     }
 
-    pub fn from_corners(a: Vec2<T::Signed>, b: Vec2<T::Signed>) -> Self
-    where
-        T::Signed: Copy + Sub<Output = T::Signed> + Ord,
-        T::Unsigned: PartialOrd,
-    {
+    pub fn from_corners(a: Vec2<T::Signed>, b: Vec2<T::Signed>) -> Self {
         let pos = a.zip_with(b, T::Signed::min);
         let size = a.zip_with(b, T::Signed::max) - pos;
-        Self::new(pos, size.try_cast().unwrap())
+        Self::new(pos, size.map(|v| T::to_unsigned(v)))
     }
 
     pub fn cast<U: IntWidth>(self) -> Rect<U>
@@ -291,10 +289,7 @@ impl<T: IntWidth> Rect<T> {
         (self.width(), self.height())
     }
 
-    pub fn area(&self) -> <T::Unsigned as Mul>::Output
-    where
-        T::Unsigned: Mul,
-    {
+    pub fn area(&self) -> T::Unsigned {
         self.width() * self.height()
     }
 
@@ -302,10 +297,7 @@ impl<T: IntWidth> Rect<T> {
         self.pos.x
     }
 
-    pub fn right(&self) -> <T::Signed as Add>::Output
-    where
-        T::Signed: Add,
-    {
+    pub fn right(&self) -> T::Signed {
         self.pos.x + T::to_signed(self.size.x)
     }
 
@@ -313,10 +305,7 @@ impl<T: IntWidth> Rect<T> {
         self.pos.y
     }
 
-    pub fn bottom(&self) -> <T::Signed as Add>::Output
-    where
-        T::Signed: Add,
-    {
+    pub fn bottom(&self) -> T::Signed {
         self.pos.y + T::to_signed(self.size.y)
     }
 }
@@ -339,10 +328,7 @@ impl<T: IntWidth> URect<T> {
         Self { pos, size }
     }
 
-    pub fn from_corners(a: Vec2<T::Unsigned>, b: Vec2<T::Unsigned>) -> Self
-    where
-        T::Unsigned: Ord + Sub<Output = T::Unsigned>,
-    {
+    pub fn from_corners(a: Vec2<T::Unsigned>, b: Vec2<T::Unsigned>) -> Self {
         let pos = a.zip_with(b, T::Unsigned::min);
         let size = a.zip_with(b, T::Unsigned::max) - pos;
         URect::new(pos, size)
@@ -370,10 +356,7 @@ impl<T: IntWidth> URect<T> {
         (self.width(), self.height())
     }
 
-    pub fn area(&self) -> <T::Unsigned as Mul>::Output
-    where
-        T::Unsigned: Mul,
-    {
+    pub fn area(&self) -> T::Unsigned {
         self.width() * self.height()
     }
 
@@ -381,10 +364,7 @@ impl<T: IntWidth> URect<T> {
         self.pos.x
     }
 
-    pub fn right(&self) -> <T::Unsigned as Add>::Output
-    where
-        T::Unsigned: Add,
-    {
+    pub fn right(&self) -> T::Unsigned {
         self.pos.x + self.size.x
     }
 
@@ -392,10 +372,7 @@ impl<T: IntWidth> URect<T> {
         self.pos.y
     }
 
-    pub fn bottom(&self) -> <T::Unsigned as Add>::Output
-    where
-        T::Unsigned: Add,
-    {
+    pub fn bottom(&self) -> T::Unsigned {
         self.pos.y + self.size.y
     }
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     env::VarError,
+    error::Error as ErrorTrait,
     ffi::OsStr,
     fmt::Debug,
     fs, io,
@@ -13,7 +14,8 @@ use embedgine_formats::{Alpha, Pixel, Rgba8, Span, SpanKind};
 use image::{GenericImageView, ImageError, ImageReader, Pixel as _};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use walkdir::WalkDir;
+use syn::Ident;
+use walkdir::{DirEntry, WalkDir};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -29,6 +31,8 @@ pub enum Error {
     Image(PathBuf, ImageError),
     #[error("{0} collided with previous instance of '{1}'")]
     Collision(PathBuf, String),
+    #[error("{0}")]
+    Other(Box<dyn ErrorTrait>),
 }
 
 impl From<io::Error> for Error {
@@ -38,7 +42,7 @@ impl From<io::Error> for Error {
 }
 
 #[derive(Debug)]
-enum EntryKind {
+pub enum EntryKind {
     Image {
         px_path: PathBuf,
         alpha_path: Option<PathBuf>,
@@ -49,10 +53,76 @@ enum EntryKind {
         row_starts: Vec<u16>,
     },
     Module(Module),
+    Tokens(TokenStream),
+}
+
+impl EntryKind {
+    fn to_tokens(&self, name: Ident) -> TokenStream {
+        match self {
+            Self::Image {
+                px_path,
+                alpha_path,
+                alpha,
+                width,
+                pixels_len,
+                spans,
+                row_starts,
+            } => {
+                let row_starts: &[u16] = if *alpha == Alpha::Opaque {
+                    &[]
+                } else {
+                    row_starts
+                };
+                let px_path = px_path.to_str().unwrap();
+                let spans = spans.iter().map(|&Span { len, kind }| {
+                    let kind = format_ident!("{kind:?}");
+                    quote! {
+                        embedgine::formats::Span {
+                            len: #len,
+                            kind: embedgine::formats::SpanKind::#kind,
+                        }
+                    }
+                });
+                let alphas = match alpha_path {
+                    Some(path) => {
+                        let path = path.to_str().unwrap();
+                        quote! { include_bytes!(#path) }
+                    }
+                    None => quote! { &[] },
+                };
+                let alpha = format_ident!("{alpha:?}");
+                quote! {
+                    pub const #name: embedgine::Image<'static, Px, embedgine::formats::#alpha> = {
+                        const DATA: &Aligned<Px, [u8; #pixels_len * std::mem::size_of::<Px>()]> = &Aligned {
+                            _align: [],
+                            bytes: *include_bytes!(#px_path)
+                        };
+                        embedgine::Image::new(
+                            #width,
+                            unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #pixels_len) },
+                            #alphas,
+                            &[#(#spans),*],
+                            &[#(#row_starts),*],
+                        )
+                    };
+                }
+            }
+            Self::Module(module) => {
+                let body = module.to_tokens();
+                quote! {
+                    pub mod #name {
+                        use super::*;
+                        #body
+                    }
+                }
+            }
+            Self::Tokens(stream) => stream.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
-struct Entry {
+pub struct Entry {
     path: PathBuf,
     kind: EntryKind,
 }
@@ -61,10 +131,14 @@ impl Entry {
     pub fn new(path: PathBuf, kind: EntryKind) -> Self {
         Self { path, kind }
     }
+
+    pub fn to_tokens(&self, name: Ident) -> TokenStream {
+        self.kind.to_tokens(name)
+    }
 }
 
 #[derive(Debug, Default)]
-struct Module {
+pub struct Module {
     entries: BTreeMap<String, Entry>,
 }
 
@@ -77,63 +151,15 @@ impl Module {
         Ok(())
     }
 
-    fn generate_inner(&self) -> TokenStream {
-        self.entries.iter().map(|(name, entry)| {
-            let name = format_ident!("{name}");
-            match &entry.kind {
-                EntryKind::Image { px_path, alpha_path, alpha, width, row_starts, pixels_len, spans } => {
-                    let row_starts: &[u16] = if *alpha == Alpha::Opaque { &[] } else { row_starts };
-                    let px_path = px_path.to_str().unwrap();
-                    let spans = spans
-                        .iter()
-                        .map(|&Span { len, kind }| {
-                            let kind = format_ident!("{kind:?}");
-                            quote! {
-                                embedgine::formats::Span {
-                                    len: #len,
-                                    kind: embedgine::formats::SpanKind::#kind,
-                                }
-                            }
-                        });
-                    let alphas = match alpha_path {
-                        Some(path) => {
-                            let path = path.to_str().unwrap();
-                            quote! { include_bytes!(#path) }
-                        }
-                        None => quote! { &[] }
-                    };
-                    let alpha = format_ident!("{alpha:?}");
-                    quote! {
-                        pub const #name: embedgine::Image<'static, Px, embedgine::formats::#alpha> = {
-                            const DATA: &Aligned<Px, [u8; #pixels_len * std::mem::size_of::<Px>()]> = &Aligned {
-                                _align: [],
-                                bytes: *include_bytes!(#px_path)
-                            };
-                            embedgine::Image::new(
-                                #width,
-                                unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #pixels_len) },
-                                #alphas,
-                                &[#(#spans),*],
-                                &[#(#row_starts),*],
-                            )
-                        };
-                    }
-                }
-                EntryKind::Module(module) => {
-                    let body = module.generate_inner();
-                    quote! {
-                        pub mod #name {
-                            use super::*;
-                            #body
-                        }
-                    }
-                }
-            }
-        }).collect()
+    fn to_tokens(&self) -> TokenStream {
+        self.entries
+            .iter()
+            .map(|(name, entry)| entry.to_tokens(format_ident!("{name}")))
+            .collect()
     }
 
     pub fn generate<Px: Pixel>(&self) -> String {
-        let body = self.generate_inner();
+        let body = self.to_tokens();
         let format = Px::FORMAT;
         let file = quote! {
             #[repr(C)]
@@ -213,30 +239,136 @@ impl DerefMut for Stack {
     }
 }
 
-fn utf8(os: &OsStr, path: impl AsRef<Path>) -> Result<String, Error> {
-    Ok(os
-        .to_str()
-        .ok_or_else(|| Error::InvalidPath(path.as_ref().to_path_buf()))?
-        .to_owned())
+pub fn utf8_or_else<E>(os: &OsStr, f: impl FnOnce() -> E) -> Result<String, E> {
+    Ok(os.to_str().ok_or_else(f)?.to_owned())
 }
 
-pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Error> {
-    println!("cargo::rerun-if-changed={}", assets_path.as_ref().display());
+pub fn utf8_from_path(os: &OsStr, path: impl AsRef<Path>) -> Result<String, Error> {
+    utf8_or_else(os, || Error::InvalidPath(path.as_ref().to_path_buf()))
+}
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(Error::InvalidOutDir)?)
-        .join("embedgine-build");
-    if !fs::metadata(&assets_path)?.is_dir() {
-        return Err(Error::InvalidRoot(assets_path.as_ref().to_path_buf()));
+pub trait Matcher {
+    fn matches(&self, path: &Path) -> bool;
+}
+
+pub struct Ext<'a>(pub &'a str);
+
+impl Matcher for Ext<'_> {
+    fn matches(&self, path: &Path) -> bool {
+        path.extension()
+            .is_some_and(|os| os.to_str().is_some_and(|ext| ext == self.0))
     }
-    fs::create_dir_all(&out_dir)?;
-    let mut stack = Stack::new(&assets_path);
-    for entry in WalkDir::new(&assets_path)
-        .follow_links(true)
-        .sort_by_file_name()
+}
+
+impl<T: Fn(&Path) -> bool> Matcher for T {
+    fn matches(&self, path: &Path) -> bool {
+        self(path)
+    }
+}
+
+pub trait Handler<Px> {
+    fn handle(&self, path: &Path) -> Result<Vec<(String, EntryKind)>, Error>;
+}
+
+impl<T: Fn(&Path) -> Result<Vec<(String, EntryKind)>, Error>, Px> Handler<Px> for T {
+    fn handle(&self, path: &Path) -> Result<Vec<(String, EntryKind)>, Error> {
+        self(path)
+    }
+}
+
+#[derive(Default)]
+pub struct Builder<'a, Px> {
+    handlers: Vec<(Box<dyn Matcher + 'a>, Box<dyn Handler<Px> + 'a>)>,
+}
+
+impl<'a, Px> Builder<'a, Px> {
+    pub fn new() -> Self
+    where
+        Px: Default,
     {
-        let entry = entry.map_err(io::Error::from)?;
-        if !entry.file_type().is_file() {
-            continue;
+        Self::default()
+    }
+
+    pub fn handler(mut self, matcher: impl Matcher + 'a, handler: impl Handler<Px> + 'a) -> Self {
+        self.handlers.push((Box::new(matcher), Box::new(handler)));
+        self
+    }
+
+    pub fn build(self, assets_path: impl AsRef<Path>) -> Result<(), Error>
+    where
+        Px: Pixel,
+    {
+        println!("cargo::rerun-if-changed={}", assets_path.as_ref().display());
+
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(Error::InvalidOutDir)?)
+            .join("embedgine-build");
+        if !fs::metadata(&assets_path)?.is_dir() {
+            return Err(Error::InvalidRoot(assets_path.as_ref().to_path_buf()));
+        }
+        fs::create_dir_all(&out_dir)?;
+        let mut stack = Stack::new(&assets_path);
+        for entry in WalkDir::new(&assets_path)
+            .follow_links(true)
+            .sort_by_file_name()
+        {
+            let entry = entry.map_err(io::Error::from)?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative_path = entry.path().strip_prefix(&assets_path).unwrap();
+            let mut dirs = relative_path
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(os) => Some(utf8_from_path(os, relative_path)),
+                    _ => None,
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            dirs.pop();
+            let common = dirs
+                .iter()
+                .zip(stack.iter().skip(1))
+                .take_while(|(name, frame)| **name == frame.name)
+                .count();
+            while stack.len() > common + 1 {
+                stack.pop_frame()?;
+            }
+            for name in dirs.into_iter().skip(common) {
+                let path = stack.last().unwrap().path.join(&name);
+                stack.push(Frame {
+                    name,
+                    module: Module::default(),
+                    path,
+                });
+            }
+            let last = stack.last_mut().unwrap();
+            for (name, kind) in self.build_entry(assets_path.as_ref(), &out_dir, &entry)? {
+                last.module
+                    .insert(name, Entry::new(entry.path().to_path_buf(), kind))?;
+            }
+        }
+        while stack.len() > 1 {
+            stack.pop_frame()?;
+        }
+        fs::write(
+            out_dir.join("assets.rs"),
+            stack.0[0].module.generate::<Px>(),
+        )?;
+        Ok(())
+    }
+
+    fn build_entry(
+        &self,
+        assets_path: &Path,
+        out_dir: &Path,
+        entry: &DirEntry,
+    ) -> Result<Vec<(String, EntryKind)>, Error>
+    where
+        Px: Pixel,
+    {
+        for (m, h) in &self.handlers {
+            if m.matches(entry.path()) {
+                return h.handle(entry.path());
+            }
         }
         let image = ImageReader::open(entry.path())?
             .decode()
@@ -270,34 +402,9 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
                 }
             }
         }
-        let relative_path = entry.path().strip_prefix(&assets_path).unwrap();
+        let relative_path = entry.path().strip_prefix(assets_path).unwrap();
         let base_out_path = out_dir.join(relative_path);
-        let px_path = base_out_path.with_extension("px.bin");
-        let mut dirs = relative_path
-            .components()
-            .filter_map(|c| match c {
-                Component::Normal(os) => Some(utf8(os, relative_path)),
-                _ => None,
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        dirs.pop();
-        let common = dirs
-            .iter()
-            .zip(stack.iter().skip(1))
-            .take_while(|(name, frame)| **name == frame.name)
-            .count();
-        while stack.len() > common + 1 {
-            stack.pop_frame()?;
-        }
-        for name in dirs.into_iter().skip(common) {
-            let path = stack.last().unwrap().path.join(&name);
-            stack.push(Frame {
-                name,
-                module: Module::default(),
-                path,
-            });
-        }
-        let stem = utf8(entry.path().file_stem().unwrap(), entry.path())?;
+        let px_path = base_out_path.with_added_extension("px.bin");
         if let Some(parent) = px_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -309,29 +416,22 @@ pub fn build<Px: Pixel + Debug>(assets_path: impl AsRef<Path>) -> Result<(), Err
         } else {
             None
         };
-        stack.last_mut().unwrap().module.insert(
-            stem.to_case(Case::UpperSnake),
-            Entry::new(
-                entry.path().to_path_buf(),
-                EntryKind::Image {
-                    px_path,
-                    alpha_path,
-                    alpha: alpha_kind,
-                    width: width as u16,
-                    pixels_len: pixels.len(),
-                    spans,
-                    row_starts,
-                },
-            ),
-        )?;
-        println!("{entry:?} - {width}x{height}");
+        let stem = utf8_from_path(entry.path().file_stem().unwrap(), entry.path())?;
+        Ok(vec![(
+            stem.to_case(Case::Constant),
+            EntryKind::Image {
+                px_path,
+                alpha_path,
+                alpha: alpha_kind,
+                width: width as u16,
+                pixels_len: pixels.len(),
+                spans,
+                row_starts,
+            },
+        )])
     }
-    while stack.len() > 1 {
-        stack.pop_frame()?;
-    }
-    fs::write(
-        out_dir.join("assets.rs"),
-        stack.0[0].module.generate::<Px>(),
-    )?;
-    Ok(())
+}
+
+pub fn build<Px: Pixel>(assets_path: impl AsRef<Path>) -> Result<(), Error> {
+    Builder::<Px>::new().build(assets_path)
 }

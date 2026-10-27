@@ -20,7 +20,7 @@ async fn main() {
         SimulatorDisplay::<pixelcolor::Rgb565>::new(Size::new(WIDTH as u32, HEIGHT as u32));
     let mut sink = DrawTargetSink::<Px, _>::new(display);
 
-    let mut renderer: Renderer<Px, _> = Renderer::with_size(Vec2::new(WIDTH, HEIGHT), HEIGHT);
+    let mut renderer: Renderer<Px, _> = Renderer::with_size(Vec2::new(WIDTH, HEIGHT), 4);
 
     renderer
         .render(

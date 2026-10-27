@@ -5,7 +5,7 @@ extern crate alloc;
 
 use core::{
     marker::PhantomData,
-    ops::{BitAnd, BitOr, BitXor, Index, IndexMut, Not, Range, Sub},
+    ops::{BitAnd, BitOr, BitXor, Index, IndexMut, Not, Range},
 };
 
 #[cfg(feature = "embedded-graphics")]
@@ -13,12 +13,13 @@ use embedded_graphics::draw_target::DrawTarget;
 pub use embedgine_formats as formats;
 use formats::{Alpha, AlphaKind, Pixel, Span};
 
-use crate::geometry::URect;
-#[cfg(feature = "embedded-graphics")]
-use crate::geometry::Vec2;
-use crate::geometry::W16;
+use crate::{
+    geometry::{URect, Vec2, W16},
+    range_ext::RangeExt,
+};
 
 pub mod geometry;
+mod range_ext;
 
 #[macro_export]
 macro_rules! include_assets {
@@ -250,19 +251,10 @@ impl<Px: Clone + Default> Renderer<Px, alloc::vec::Vec<Px>> {
     }
 }
 
-fn map_range<T, U>(range: &Range<T>, mut f: impl FnMut(&T) -> U) -> Range<U> {
-    f(&range.start)..f(&range.end)
-}
-
-fn mirror_range<T: Copy + Sub>(range: &Range<T>, axis: T) -> Range<<T as Sub>::Output> {
-    axis - range.end..axis - range.start
-}
-
-fn intersect_ranges<T: Ord>(a: Range<T>, b: Range<T>) -> Option<Range<T>> {
-    let start = a.start.max(b.start);
-    let end = a.end.min(b.end);
-
-    if start < end { Some(start..end) } else { None }
+fn copy_iter<'a, T: Copy + 'a>(iter: impl Iterator<Item = (&'a mut T, &'a T)>) {
+    for (d, &s) in iter {
+        *d = s
+    }
 }
 
 pub struct Canvas<Px, B> {
@@ -321,71 +313,71 @@ impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
         let (width, height) = image.size().as_tuple();
         let (out_width, out_height) = transform.swap_if_transposed(width, height);
         let (step, flipped) = if transform.is_transposed() {
-            (self.width() as i16, transform.is_flipped_y())
+            (self.width() as u16, transform.is_flipped_y())
         } else {
             (1, transform.is_flipped_x())
         };
-        let stride = if flipped { -step } else { step };
         match K::KIND {
             Alpha::Opaque => {
                 let Some(out_x) =
-                    intersect_ranges(0..self.width() as i16, pos.x..pos.x + out_width as i16)
+                    (0..self.width() as i16).intersection(pos.x..pos.x + out_width as i16)
                 else {
                     return;
                 };
-                let Some(out_y) = intersect_ranges(
-                    map_range(&self.band, |&v| v as i16),
-                    pos.y..pos.y + out_height as i16,
-                ) else {
+                let Some(out_y) = self
+                    .band
+                    .clone()
+                    .map_ends(|v| v as i16)
+                    .intersection(pos.y..pos.y + out_height as i16)
+                else {
                     return;
                 };
-                let (mut in_x, mut in_y) = transform.swap_if_transposed(
-                    map_range(&out_x, |&v| v - pos.x),
-                    map_range(&out_y, |&v| v - pos.y),
+                let (mut in_x, mut in_y) = (
+                    out_x.clone().map_ends(|v| v - pos.x),
+                    out_y.clone().map_ends(|v| v - pos.y),
                 );
-                let (in_flip_x, in_flip_y) = transform
-                    .swap_if_transposed(transform.is_flipped_x(), transform.is_flipped_y());
-                if in_flip_x {
-                    in_x = mirror_range(&in_x, image.width as i16);
+                if transform.is_flipped_x() {
+                    in_x = in_x.sub_from(out_width as i16);
                 }
-                if in_flip_y {
-                    in_y = mirror_range(&in_y, image.height() as i16);
+                if transform.is_flipped_y() {
+                    in_y = in_y.sub_from(out_height as i16);
                 }
+                (in_x, in_y) = transform.swap_if_transposed(in_x, in_y);
                 let mut i = in_y.start as u32 * image.width as u32;
-                for (y, span) in image.spans[in_y.start as usize..in_y.end as usize]
+                for (mut y, span) in image.spans[in_y.start as usize..in_y.end as usize]
                     .iter()
                     .enumerate()
                 {
+                    if transform.src_y_reversed() {
+                        y = in_y.len() - 1 - y;
+                    }
                     let (mut x, mut y) = transform.swap_if_transposed(0, y as u16);
-                    if transform.is_flipped_x() {
-                        x = out_x.len() as u16 - 1 - x;
-                    }
-                    if transform.is_flipped_y() {
-                        y = out_y.len() as u16 - 1 - y;
-                    }
                     x += out_x.start as u16;
                     y += out_y.start as u16;
                     let start = i;
                     i += span.len as u32;
-                    let row_range = map_range(&in_x, |&v| v as usize);
+                    let row_range = in_x.clone().map_ends(|v| v as usize);
                     let src = &image.pixels[start as usize..i as usize][row_range];
-                    let mut start = self.buffer_index(Vec2::new(x, y));
+                    let start = self.buffer_index(Vec2::new(x, y));
                     let buf = self.buffer.as_mut();
-                    match stride {
-                        1 => buf[start..start + src.len()].copy_from_slice(src),
-                        -1 => {
-                            let dest = &mut buf[start + 1 - src.len()..];
-                            for (d, &s) in dest.iter_mut().zip(src) {
-                                *d = s;
+                    match step {
+                        1 => {
+                            if flipped {
+                                for (d, &s) in
+                                    buf[start..start + src.len()].iter_mut().rev().zip(src)
+                                {
+                                    *d = s;
+                                }
+                            } else {
+                                buf[start..start + src.len()].copy_from_slice(src);
                             }
                         }
-                        mut s => {
-                            if s < 0 {
-                                s = -s;
-                                start -= (src.len() - 1) * s as usize;
-                            }
-                            for (d, &s) in buf[start..].iter_mut().step_by(s as usize).zip(src) {
-                                *d = s;
+                        s => {
+                            let iter = buf[start..].iter_mut().step_by(s as usize).take(src.len());
+                            if flipped {
+                                copy_iter(iter.rev().zip(src));
+                            } else {
+                                copy_iter(iter.zip(src));
                             }
                         }
                     }
@@ -412,7 +404,7 @@ impl<Px, B: AsRef<[Px]> + AsMut<[Px]>> IndexMut<Vec2<u16>> for Canvas<Px, B> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Transform {
     // Bits (most to least significant): flip x, flip y, transpose (swap x and y)
@@ -441,24 +433,46 @@ impl Transform {
         }
     }
 
+    #[inline]
     pub const fn from_bits(flip_x: bool, flip_y: bool, transpose: bool) -> Self {
         Self::from_u8((flip_x as u8) << 2 | (flip_y as u8) << 1 | transpose as u8)
     }
 
+    #[inline]
     pub const fn is_flipped_x(self) -> bool {
         self as u8 & 0b100 != 0
     }
 
+    #[inline]
     pub const fn is_flipped_y(self) -> bool {
         self as u8 & 0b010 != 0
     }
 
+    #[inline]
     pub const fn is_transposed(self) -> bool {
         self as u8 & 0b001 != 0
     }
 
     pub const fn swap_if_transposed<T>(self, a: T, b: T) -> (T, T) {
         if self.is_transposed() { (b, a) } else { (a, b) }
+    }
+
+    #[inline]
+    pub const fn src_x_reversed(self) -> bool {
+        if self.is_transposed() {
+            self.is_flipped_y()
+        } else {
+            self.is_flipped_x()
+        }
+    }
+
+    #[inline]
+    pub const fn src_y_reversed(self) -> bool {
+        if self.is_transposed() {
+            self.is_flipped_x()
+        } else {
+            self.is_flipped_y()
+        }
     }
 }
 
