@@ -339,9 +339,10 @@ dependencies = [
 name = "embedgine"
 version = "0.1.0"
 dependencies = [
- "embedded-graphics",
+ "embedded-graphics-core",
  "embedgine-build",
  "embedgine-formats",
+ "num-traits",
  "pastey 0.2.3",
 ]
 
@@ -366,7 +367,7 @@ name = "embedgine-formats"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "embedded-graphics",
+ "embedded-graphics-core",
  "pastey 0.2.3",
 ]
 

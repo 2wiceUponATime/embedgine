@@ -9,17 +9,24 @@ use core::{
 };
 
 #[cfg(feature = "embedded-graphics")]
-use embedded_graphics::draw_target::DrawTarget;
+use embedded_graphics_core::draw_target::DrawTarget;
 pub use embedgine_formats as formats;
+use embedgine_formats::{Blend, Blended, Masked, Opaque, RowStart, SpanKind};
 use formats::{Alpha, AlphaKind, Pixel, Span};
 
 use crate::{
+    array_cursor::ArrayCursor,
     geometry::{URect, Vec2, W16},
     range_ext::RangeExt,
 };
 
+mod array_cursor;
 pub mod geometry;
 mod range_ext;
+
+mod sealed {
+    pub trait Sealed {}
+}
 
 #[macro_export]
 macro_rules! include_assets {
@@ -27,14 +34,13 @@ macro_rules! include_assets {
         include!(concat!(env!("OUT_DIR"), "/embedgine-build/assets.rs"));
     };
 }
-
 #[derive(Debug)]
 pub struct Image<'a, Px, K> {
     width: u16,
     pixels: &'a [Px],
     alphas: &'a [u8],
     spans: &'a [Span],
-    row_starts: &'a [u16],
+    row_starts: &'a [RowStart],
     _k: PhantomData<fn() -> K>,
 }
 
@@ -44,7 +50,7 @@ impl<'a, Px, K: AlphaKind> Image<'a, Px, K> {
         pixels: &'a [Px],
         alphas: &'a [u8],
         spans: &'a [Span],
-        row_starts: &'a [u16],
+        row_starts: &'a [RowStart],
     ) -> Self {
         Self {
             width,
@@ -257,6 +263,89 @@ fn copy_iter<'a, T: Copy + 'a>(iter: impl Iterator<Item = (&'a mut T, &'a T)>) {
     }
 }
 
+fn blend_iter<'a, Px: Copy + 'a, K: DrawAlpha<Px>>(
+    iter: impl Iterator<Item = (&'a mut Px, (&'a Px, &'a u8))>,
+) {
+    for (d, (&s, &alpha)) in iter {
+        *d = K::blend(*d, s, alpha);
+    }
+}
+
+fn write_pixels<Px: Copy>(buf: &mut [Px], start: usize, step: u16, flipped: bool, src: &[Px]) {
+    match step {
+        1 => {
+            let dst = &mut buf[start..start + src.len()];
+            if flipped {
+                copy_iter(dst.iter_mut().rev().zip(src));
+            } else {
+                dst.copy_from_slice(src);
+            }
+        }
+        s => {
+            let iter = buf[start..].iter_mut().step_by(s as usize).take(src.len());
+            if flipped {
+                copy_iter(iter.rev().zip(src));
+            } else {
+                copy_iter(iter.zip(src));
+            }
+        }
+    }
+}
+
+fn blend_pixels<Px: Copy, K: DrawAlpha<Px>>(
+    buf: &mut [Px],
+    start: usize,
+    step: u16,
+    flipped: bool,
+    src: &[Px],
+    alphas: &[u8],
+) {
+    let src = src.iter().zip(alphas);
+    match step {
+        1 => {
+            let dst = &mut buf[start..start + src.len()];
+            if flipped {
+                blend_iter::<Px, K>(dst.iter_mut().rev().zip(src));
+            } else {
+                blend_iter::<Px, K>(dst.iter_mut().zip(src));
+            }
+        }
+        s => {
+            let iter = buf[start..].iter_mut().step_by(s as usize).take(src.len());
+            if flipped {
+                blend_iter::<Px, K>(iter.rev().zip(src));
+            } else {
+                blend_iter::<Px, K>(iter.zip(src));
+            }
+        }
+    }
+}
+
+pub trait DrawAlpha<Px>: AlphaKind + sealed::Sealed {
+    fn blend(dst: Px, src: Px, alpha: u8) -> Px;
+}
+
+impl sealed::Sealed for Opaque {}
+impl<Px> DrawAlpha<Px> for Opaque {
+    fn blend(_: Px, src: Px, _: u8) -> Px {
+        src
+    }
+}
+
+impl sealed::Sealed for Masked {}
+impl<Px> DrawAlpha<Px> for Masked {
+    fn blend(_: Px, src: Px, _: u8) -> Px {
+        src
+    }
+}
+
+impl sealed::Sealed for Blended {}
+impl<Px: Blend> DrawAlpha<Px> for Blended {
+    fn blend(dst: Px, src: Px, alpha: u8) -> Px {
+        dst.blend(src, alpha)
+    }
+}
+
 pub struct Canvas<Px, B> {
     size: Vec2<u16>,
     band: Range<u16>,
@@ -304,87 +393,124 @@ impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
         self.buffer.as_mut().fill(color);
     }
 
-    pub fn draw_image<K: AlphaKind>(
+    pub fn draw_image<K: DrawAlpha<Px>>(
         &mut self,
         image: &Image<'_, Px, K>,
         pos: Vec2<i16>,
         transform: Transform,
     ) {
-        let (width, height) = image.size().as_tuple();
-        let (out_width, out_height) = transform.swap_if_transposed(width, height);
-        let (step, flipped) = if transform.is_transposed() {
-            (self.width() as u16, transform.is_flipped_y())
+        let Vec2 {
+            x: out_width,
+            y: out_height,
+        } = transform.swap_if_transposed(image.size());
+        let step = if transform.is_transposed() {
+            self.width()
         } else {
-            (1, transform.is_flipped_x())
+            1
         };
+        let flipped = transform.src_reversed().x;
+        let Some(out_x) = (0..self.width() as i16).intersection(pos.x..pos.x + out_width as i16)
+        else {
+            return;
+        };
+        let Some(out_y) = self
+            .band
+            .clone()
+            .cast()
+            .intersection(pos.y..pos.y + out_height as i16)
+        else {
+            return;
+        };
+        let (mut in_x, mut in_y) = (out_x.clone().sub(pos.x), out_y.clone().sub(pos.y));
+        if transform.is_flipped_x() {
+            in_x = in_x.sub_from(out_width as i16);
+        }
+        if transform.is_flipped_y() {
+            in_y = in_y.sub_from(out_height as i16);
+        }
+        (in_x, in_y) = transform.swap_if_transposed((in_x, in_y));
         match K::KIND {
             Alpha::Opaque => {
-                let Some(out_x) =
-                    (0..self.width() as i16).intersection(pos.x..pos.x + out_width as i16)
-                else {
-                    return;
-                };
-                let Some(out_y) = self
-                    .band
-                    .clone()
-                    .map_ends(|v| v as i16)
-                    .intersection(pos.y..pos.y + out_height as i16)
-                else {
-                    return;
-                };
-                let (mut in_x, mut in_y) = (
-                    out_x.clone().map_ends(|v| v - pos.x),
-                    out_y.clone().map_ends(|v| v - pos.y),
-                );
-                if transform.is_flipped_x() {
-                    in_x = in_x.sub_from(out_width as i16);
-                }
-                if transform.is_flipped_y() {
-                    in_y = in_y.sub_from(out_height as i16);
-                }
-                (in_x, in_y) = transform.swap_if_transposed(in_x, in_y);
-                let mut i = in_y.start as u32 * image.width as u32;
+                let mut px = ArrayCursor::new(in_y.start as u32 * image.width() as u32);
                 for (mut y, span) in image.spans[in_y.start as usize..in_y.end as usize]
                     .iter()
                     .enumerate()
                 {
-                    if transform.src_y_reversed() {
+                    if transform.src_reversed().y {
                         y = in_y.len() - 1 - y;
                     }
-                    let (mut x, mut y) = transform.swap_if_transposed(0, y as u16);
+                    let (mut x, mut y) = transform.swap_if_transposed((0, y as u16));
                     x += out_x.start as u16;
                     y += out_y.start as u16;
-                    let start = i;
-                    i += span.len as u32;
-                    let row_range = in_x.clone().map_ends(|v| v as usize);
-                    let src = &image.pixels[start as usize..i as usize][row_range];
+                    let row_range = in_x.clone().cast();
+                    let src = &image.pixels[px.step(span.len)][row_range];
                     let start = self.buffer_index(Vec2::new(x, y));
-                    let buf = self.buffer.as_mut();
-                    match step {
-                        1 => {
-                            if flipped {
-                                for (d, &s) in
-                                    buf[start..start + src.len()].iter_mut().rev().zip(src)
-                                {
-                                    *d = s;
-                                }
-                            } else {
-                                buf[start..start + src.len()].copy_from_slice(src);
-                            }
+                    write_pixels(self.buffer.as_mut(), start, step, flipped, src);
+                }
+            }
+            Alpha::Masked | Alpha::Blended => {
+                let in_x = in_x.cast::<u16>();
+                let map = |sx: u16, sy: u16| {
+                    let (mut x, mut y) = transform.swap_if_transposed((sx, sy));
+                    if transform.is_flipped_x() {
+                        x = out_width - 1 - x;
+                    }
+                    if transform.is_flipped_y() {
+                        y = out_height - 1 - y;
+                    }
+                    Vec2::new((pos.x + x as i16) as u16, (pos.y + y as i16) as u16)
+                };
+                for src_y in in_y.cast::<u16>() {
+                    let row_start = &image.row_starts[src_y as usize];
+                    let spans_end = image
+                        .row_starts
+                        .get(src_y as usize + 1)
+                        .map(|s| s.span_idx as usize)
+                        .unwrap_or(image.spans.len());
+                    let mut px = ArrayCursor::new(row_start.px_idx);
+                    let mut alpha = ArrayCursor::new(row_start.alpha_idx);
+                    let mut src_x = 0;
+                    for span in &image.spans[row_start.span_idx as usize..spans_end] {
+                        if src_x >= in_x.end {
+                            break;
                         }
-                        s => {
-                            let iter = buf[start..].iter_mut().step_by(s as usize).take(src.len());
-                            if flipped {
-                                copy_iter(iter.rev().zip(src));
-                            } else {
-                                copy_iter(iter.zip(src));
+                        let span_range = src_x..src_x + span.len;
+                        src_x += span.len;
+                        if span.kind == SpanKind::Transparent {
+                            continue;
+                        }
+                        let px_range = px.step(span.len);
+                        let alpha_range = if span.kind == SpanKind::Blended {
+                            if K::KIND != Alpha::Blended {
+                                panic!("Unexpected SpanKind::Blended span in Alpha::Masked image");
                             }
+                            alpha.step(span.len)
+                        } else {
+                            0..0
+                        };
+                        let Some(range) = span_range.clone().intersection(in_x.clone()) else {
+                            continue;
+                        };
+                        let span_offset = range.clone().sub(span_range.start).cast::<usize>();
+                        let src = &image.pixels[px_range][span_offset.clone()];
+                        let first = if flipped { range.end - 1 } else { range.start };
+                        let start = self.buffer_index(map(first, src_y));
+                        if span.kind == SpanKind::Blended {
+                            let alphas = &image.alphas[alpha_range][span_offset];
+                            blend_pixels::<Px, K>(
+                                self.buffer.as_mut(),
+                                start,
+                                step,
+                                flipped,
+                                src,
+                                alphas,
+                            );
+                        } else {
+                            write_pixels(self.buffer.as_mut(), start, step, flipped, src);
                         }
                     }
                 }
             }
-            Alpha::Masked => todo!(),
-            Alpha::Blended => todo!(),
         }
     }
 }
@@ -404,17 +530,36 @@ impl<Px, B: AsRef<[Px]> + AsMut<[Px]>> IndexMut<Vec2<u16>> for Canvas<Px, B> {
     }
 }
 
+pub trait Transpose {
+    fn transposed(self) -> Self;
+}
+
+impl<T> Transpose for (T, T) {
+    #[inline]
+    fn transposed(self) -> Self {
+        (self.1, self.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Transform {
     // Bits (most to least significant): flip x, flip y, transpose (swap x and y)
+    /// No transformation
     Identity = 0b000,
+    /// Mirror along a 45° diagonal bisecting the top left corner
     Transpose = 0b001,
+    /// Flip along the Y axis
     FlipY = 0b010,
+    /// Rotate 90° counterclockwise
     RotCcw = 0b011,
+    /// Flip along the X axis
     FlipX = 0b100,
+    /// Rotate 90° clockwise
     RotCw = 0b101,
+    /// Rotate 180°
     Rot180 = 0b110,
+    /// Mirror along a 45° diagonal bisecting the top right corner
     Transverse = 0b111,
 }
 
@@ -453,26 +598,16 @@ impl Transform {
         self as u8 & 0b001 != 0
     }
 
-    pub const fn swap_if_transposed<T>(self, a: T, b: T) -> (T, T) {
-        if self.is_transposed() { (b, a) } else { (a, b) }
-    }
-
-    #[inline]
-    pub const fn src_x_reversed(self) -> bool {
+    pub fn swap_if_transposed<T: Transpose>(self, value: T) -> T {
         if self.is_transposed() {
-            self.is_flipped_y()
+            value.transposed()
         } else {
-            self.is_flipped_x()
+            value
         }
     }
 
-    #[inline]
-    pub const fn src_y_reversed(self) -> bool {
-        if self.is_transposed() {
-            self.is_flipped_x()
-        } else {
-            self.is_flipped_y()
-        }
+    pub fn src_reversed(self) -> Vec2<bool> {
+        self.swap_if_transposed(Vec2::new(self.is_flipped_x(), self.is_flipped_y()))
     }
 }
 

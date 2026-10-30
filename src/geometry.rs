@@ -1,8 +1,11 @@
 #[cfg(feature = "embedded-graphics")]
-use embedded_graphics::{
+use embedded_graphics_core::{
     geometry::{Point, Size},
     primitives::Rectangle,
 };
+use num_traits::AsPrimitive;
+
+use crate::Transpose;
 
 mod private {
     pub trait Sealed {}
@@ -22,8 +25,8 @@ scalars!(
 macro_rules! int_widths {
     ($($ty:ident($signed:ident, $unsigned:ident $(,)?)),+ $(,)?) => {
         pub trait IntWidth: private::Sealed {
-            int_widths!(@ty Signed);
-            int_widths!(@ty Unsigned);
+            int_widths!(@ty Signed, Unsigned);
+            int_widths!(@ty Unsigned, Signed);
 
             const SIGNED_MAX: Self::Signed;
 
@@ -52,12 +55,12 @@ macro_rules! int_widths {
             }
         )+
     };
-    (@ty $name:ident) => {
+    (@ty $name:ident, $other:ident) => {
         //type $name: Copy + Add<Output = Self::$name> + Sub<Output = Self::$name>;
-        int_widths!(@ty $name, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, Not);
+        int_widths!(@ty $name, $other, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, Not);
     };
-    (@ty $name:ident, $($trait:ident),+) => {
-        type $name: $(core::ops::$trait<Output = Self::$name> +)+ Copy + Ord;
+    (@ty $name:ident, $other:ident, $($trait:ident),+) => {
+        type $name: $(core::ops::$trait<Output = Self::$name> +)+ Copy + Ord + 'static;
     }
 }
 
@@ -149,8 +152,11 @@ impl<T> Vec2<T> {
     }
 
     #[inline]
-    pub fn cast<U: From<T>>(self) -> Vec2<U> {
-        self.map(|v| v.into())
+    pub fn cast<U: Copy + 'static>(self) -> Vec2<U>
+    where
+        T: AsPrimitive<U>,
+    {
+        self.map(|v| v.as_())
     }
 
     #[inline]
@@ -182,6 +188,12 @@ impl<T> Vec2<T> {
     #[inline]
     pub fn from_tuple((x, y): (T, T)) -> Self {
         Self::new(x, y)
+    }
+}
+
+impl<T> Transpose for Vec2<T> {
+    fn transposed(self) -> Self {
+        Self::new(self.y, self.x)
     }
 }
 
@@ -268,8 +280,8 @@ impl<T: IntWidth> Rect<T> {
 
     pub fn cast<U: IntWidth>(self) -> Rect<U>
     where
-        U::Signed: From<T::Signed>,
-        U::Unsigned: From<T::Unsigned>,
+        T::Signed: AsPrimitive<U::Signed>,
+        T::Unsigned: AsPrimitive<U::Unsigned>,
     {
         Rect {
             pos: self.pos.cast(),
@@ -336,7 +348,7 @@ impl<T: IntWidth> URect<T> {
 
     pub fn cast<U: IntWidth>(self) -> URect<U>
     where
-        U::Unsigned: From<T::Unsigned>,
+        T::Unsigned: AsPrimitive<U::Unsigned>,
     {
         URect {
             pos: self.pos.cast(),

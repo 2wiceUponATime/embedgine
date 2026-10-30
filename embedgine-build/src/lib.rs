@@ -5,12 +5,13 @@ use std::{
     ffi::OsStr,
     fmt::Debug,
     fs, io,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
     path::{Component, Path, PathBuf},
 };
 
 use convert_case::{Case, Casing};
-use embedgine_formats::{Alpha, Pixel, Rgba8, Span, SpanKind};
+use embedgine_formats::{Alpha, Pixel, Rgba8, RowStart, Span, SpanKind};
 use image::{GenericImageView, ImageError, ImageReader, Pixel as _};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -50,7 +51,7 @@ pub enum EntryKind {
         width: u16,
         pixels_len: usize,
         spans: Vec<Span>,
-        row_starts: Vec<u16>,
+        row_starts: Vec<RowStart>,
     },
     Module(Module),
     Tokens(TokenStream),
@@ -68,10 +69,27 @@ impl EntryKind {
                 spans,
                 row_starts,
             } => {
-                let row_starts: &[u16] = if *alpha == Alpha::Opaque {
-                    &[]
+                let row_starts: Vec<TokenStream> = if *alpha == Alpha::Opaque {
+                    vec![]
                 } else {
                     row_starts
+                        .iter()
+                        .map(
+                            |&RowStart {
+                                 px_idx,
+                                 alpha_idx,
+                                 span_idx,
+                             }| {
+                                quote! {
+                                    embedgine::formats::RowStart {
+                                        px_idx: #px_idx,
+                                        alpha_idx: #alpha_idx,
+                                        span_idx: #span_idx,
+                                    }
+                                }
+                            },
+                        )
+                        .collect()
                 };
                 let px_path = px_path.to_str().unwrap();
                 let spans = spans.iter().map(|&Span { len, kind }| {
@@ -260,9 +278,53 @@ impl Matcher for Ext<'_> {
     }
 }
 
+pub struct AnyOf<T, M>(pub T, PhantomData<M>);
+
+impl<T, M> AnyOf<T, M> {
+    pub fn new(value: T) -> Self {
+        Self(value, PhantomData)
+    }
+}
+
+impl<T: AsRef<[M]>, M: Matcher> Matcher for AnyOf<T, M> {
+    fn matches(&self, path: &Path) -> bool {
+        for m in self.0.as_ref() {
+            if m.matches(path) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub struct AllOf<T, M>(pub T, PhantomData<M>);
+
+impl<T, M> AllOf<T, M> {
+    pub fn new(value: T) -> Self {
+        Self(value, PhantomData)
+    }
+}
+
+impl<T: AsRef<[M]>, M: Matcher> Matcher for AllOf<T, M> {
+    fn matches(&self, path: &Path) -> bool {
+        for m in self.0.as_ref() {
+            if !m.matches(path) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 impl<T: Fn(&Path) -> bool> Matcher for T {
     fn matches(&self, path: &Path) -> bool {
         self(path)
+    }
+}
+
+impl Matcher for Box<dyn Matcher + '_> {
+    fn matches(&self, path: &Path) -> bool {
+        (**self).matches(path)
     }
 }
 
@@ -276,9 +338,19 @@ impl<T: Fn(&Path) -> Result<Vec<(String, EntryKind)>, Error>, Px> Handler<Px> fo
     }
 }
 
+pub struct Skip;
+
+impl<Px> Handler<Px> for Skip {
+    fn handle(&self, _: &Path) -> Result<Vec<(String, EntryKind)>, Error> {
+        Ok(vec![])
+    }
+}
+
+pub type HandlerPair<'a, Px> = (Box<dyn Matcher + 'a>, Box<dyn Handler<Px> + 'a>);
+
 #[derive(Default)]
 pub struct Builder<'a, Px> {
-    handlers: Vec<(Box<dyn Matcher + 'a>, Box<dyn Handler<Px> + 'a>)>,
+    handlers: Vec<HandlerPair<'a, Px>>,
 }
 
 impl<'a, Px> Builder<'a, Px> {
@@ -387,7 +459,11 @@ impl<'a, Px> Builder<'a, Px> {
                 let alpha: Alpha = kind.into();
                 alpha_kind = alpha_kind.max(alpha);
                 if x == 0 {
-                    row_starts.push(spans.len() as u16);
+                    row_starts.push(RowStart {
+                        px_idx: pixels.len() as u32,
+                        alpha_idx: alphas.len() as u32,
+                        span_idx: spans.len() as u16,
+                    });
                 }
                 if x == 0 || spans.last().is_none_or(|s| Alpha::from(s.kind) != alpha) {
                     spans.push(Span { len: 0, kind });

@@ -11,13 +11,14 @@ codegen-units = 1
 default = ["embedded-graphics"]
 alloc = []
 embedded-graphics = [
-  "dep:embedded-graphics",
+  "dep:embedded-graphics-core",
   "embedgine-formats/embedded-graphics",
 ]
 
 [dependencies]
-embedded-graphics = { version = "0.8.2", optional = true }
+embedded-graphics-core = { version = "0.4.1", optional = true }
 embedgine-formats = { version = "0.1.0", path = "embedgine-formats", default-features = false }
+num-traits = { version = "0.2.19", default-features = false }
 pastey = "0.2.3"
 
 [workspace]

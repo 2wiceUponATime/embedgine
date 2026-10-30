@@ -1,7 +1,8 @@
 use embedded_graphics::{geometry::Size, pixelcolor};
 use embedded_graphics_simulator::{SimulatorDisplay, Window};
 use embedgine::{
-    Canvas, DrawTargetSink, Renderer, Transform, formats::Rgb565Le as Px, geometry::Vec2,
+    Canvas, DrawTargetSink, Renderer, Transform, formats::embedded_graphics::Rgb565Le as Px,
+    geometry::Vec2,
 };
 
 mod assets {
@@ -27,7 +28,7 @@ async fn main() {
             |c: &mut Canvas<Px, _>| {
                 let v = (c.band().start as u32 * 256 / HEIGHT as u32) as u8;
                 c.fill(Px::from_rgb8(v, v, v));
-                let img: embedgine::Image<'_, Px, embedgine::formats::Opaque> = assets::OPAQUE;
+                let img = assets::MASKED;
                 let mut offset = img.width();
                 for t in [
                     Transform::Identity,
