@@ -1,4 +1,4 @@
-use core::ops::Range;
+use core::range::Range;
 
 use crate::range_ext::RangeExt;
 
@@ -14,6 +14,6 @@ impl ArrayCursor {
     pub fn step(&mut self, step: u16) -> Range<usize> {
         let start = self.index;
         self.index += step as u32;
-        (start..self.index).cast()
+        Range::from(start..self.index).cast()
     }
 }

@@ -28,7 +28,7 @@ async fn main() {
             |c: &mut Canvas<Px, _>| {
                 let v = (c.band().start as u32 * 256 / HEIGHT as u32) as u8;
                 c.fill(Px::from_rgb8(v, v, v));
-                let img = assets::MASKED;
+                let img = assets::BLENDED;
                 let mut offset = img.width();
                 for t in [
                     Transform::Identity,

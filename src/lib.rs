@@ -5,7 +5,8 @@ extern crate alloc;
 
 use core::{
     marker::PhantomData,
-    ops::{BitAnd, BitOr, BitXor, Index, IndexMut, Not, Range},
+    ops::{BitAnd, BitOr, BitXor, Index, IndexMut, Not},
+    range::Range,
 };
 
 #[cfg(feature = "embedded-graphics")]
@@ -159,7 +160,7 @@ impl<Px, B> Renderer<Px, B> {
         Self {
             size,
             band_height,
-            buffers: buffers.map(|b| Canvas::new(size, 0..band_height, b)),
+            buffers: buffers.map(|b| Canvas::new(size, (0..band_height).into(), b)),
             _px: PhantomData,
         }
     }
@@ -183,7 +184,7 @@ impl<Px, B> Renderer<Px, B> {
     pub fn bands(height: u16, band_height: u16) -> impl Iterator<Item = Range<u16>> {
         (0..height)
             .step_by(band_height as usize)
-            .map(move |y| y..(y + band_height).min(height))
+            .map(move |y| (y..(y + band_height).min(height)).into())
     }
 
     pub fn resize(&mut self, size: Vec2<u16>, band_height: u16, buffers: [B; 2])
@@ -195,7 +196,7 @@ impl<Px, B> Renderer<Px, B> {
         for b in &buffers {
             assert_eq!(b.as_ref().len(), self.buffer_len(), "invalid buffer size");
         }
-        self.buffers = buffers.map(|b| Canvas::new(size, 0..band_height, b));
+        self.buffers = buffers.map(|b| Canvas::new(size, (0..band_height).into(), b));
     }
 
     pub fn into_inner(self) -> [Canvas<Px, B>; 2] {
@@ -215,7 +216,7 @@ impl<Px, B> Renderer<Px, B> {
         let [mut drawing, mut presenting] = self.buffers.each_mut();
         let mut pending = None;
         for band in Self::bands(size.y, self.band_height) {
-            drawing.band = band.clone();
+            drawing.band = band;
             draw.draw(drawing);
             if let Some(f) = { pending } {
                 f.await?;
@@ -376,11 +377,11 @@ impl<Px, B> Canvas<Px, B> {
     }
 
     pub fn full(size: Vec2<u16>, buffer: B) -> Self {
-        Self::new(size, 0..size.y, buffer)
+        Self::new(size, (0..size.y).into(), buffer)
     }
 
-    pub fn band(&self) -> &Range<u16> {
-        &self.band
+    pub fn band(&self) -> Range<u16> {
+        self.band
     }
 
     fn buffer_index(&self, Vec2 { x, y }: Vec2<u16>) -> usize {
@@ -399,34 +400,31 @@ impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
         pos: Vec2<i16>,
         transform: Transform,
     ) {
-        let Vec2 {
-            x: out_width,
-            y: out_height,
-        } = transform.swap_if_transposed(image.size());
+        let out_size = transform.swap_if_transposed(image.size());
         let step = if transform.is_transposed() {
             self.width()
         } else {
             1
         };
         let flipped = transform.src_reversed().x;
-        let Some(out_x) = (0..self.width() as i16).intersection(pos.x..pos.x + out_width as i16)
+        let Some(out_x) = Range::from(0..self.width() as i16)
+            .intersection((pos.x..pos.x + out_size.x as i16).into())
         else {
             return;
         };
         let Some(out_y) = self
             .band
-            .clone()
             .cast()
-            .intersection(pos.y..pos.y + out_height as i16)
+            .intersection((pos.y..pos.y + out_size.y as i16).into())
         else {
             return;
         };
-        let (mut in_x, mut in_y) = (out_x.clone().sub(pos.x), out_y.clone().sub(pos.y));
+        let (mut in_x, mut in_y) = (out_x.sub(pos.x), out_y.sub(pos.y));
         if transform.is_flipped_x() {
-            in_x = in_x.sub_from(out_width as i16);
+            in_x = in_x.sub_from(out_size.x as i16);
         }
         if transform.is_flipped_y() {
-            in_y = in_y.sub_from(out_height as i16);
+            in_y = in_y.sub_from(out_size.y as i16);
         }
         (in_x, in_y) = transform.swap_if_transposed((in_x, in_y));
         match K::KIND {
@@ -437,14 +435,13 @@ impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
                     .enumerate()
                 {
                     if transform.src_reversed().y {
-                        y = in_y.len() - 1 - y;
+                        y = in_y.len() as usize - 1 - y;
                     }
-                    let (mut x, mut y) = transform.swap_if_transposed((0, y as u16));
-                    x += out_x.start as u16;
-                    y += out_y.start as u16;
-                    let row_range = in_x.clone().cast();
+                    let dst = transform.swap_if_transposed(Vec2::new(0, y as u16))
+                        + Vec2::new(out_x.start, out_y.start).cast::<u16>();
+                    let row_range = in_x.cast();
                     let src = &image.pixels[px.step(span.len)][row_range];
-                    let start = self.buffer_index(Vec2::new(x, y));
+                    let start = self.buffer_index(dst);
                     write_pixels(self.buffer.as_mut(), start, step, flipped, src);
                 }
             }
@@ -453,10 +450,10 @@ impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
                 let map = |sx: u16, sy: u16| {
                     let (mut x, mut y) = transform.swap_if_transposed((sx, sy));
                     if transform.is_flipped_x() {
-                        x = out_width - 1 - x;
+                        x = out_size.x - 1 - x;
                     }
                     if transform.is_flipped_y() {
-                        y = out_height - 1 - y;
+                        y = out_size.y - 1 - y;
                     }
                     Vec2::new((pos.x + x as i16) as u16, (pos.y + y as i16) as u16)
                 };
@@ -474,7 +471,7 @@ impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
                         if src_x >= in_x.end {
                             break;
                         }
-                        let span_range = src_x..src_x + span.len;
+                        let span_range = Range::from(src_x..src_x + span.len);
                         src_x += span.len;
                         if span.kind == SpanKind::Transparent {
                             continue;
@@ -486,13 +483,13 @@ impl<Px: Copy, B: AsMut<[Px]>> Canvas<Px, B> {
                             }
                             alpha.step(span.len)
                         } else {
-                            0..0
+                            (0..0).into()
                         };
-                        let Some(range) = span_range.clone().intersection(in_x.clone()) else {
+                        let Some(range) = span_range.intersection(in_x) else {
                             continue;
                         };
-                        let span_offset = range.clone().sub(span_range.start).cast::<usize>();
-                        let src = &image.pixels[px_range][span_offset.clone()];
+                        let span_offset = range.sub(span_range.start).cast::<usize>();
+                        let src = &image.pixels[px_range][span_offset];
                         let first = if flipped { range.end - 1 } else { range.start };
                         let start = self.buffer_index(map(first, src_y));
                         if span.kind == SpanKind::Blended {
@@ -598,6 +595,7 @@ impl Transform {
         self as u8 & 0b001 != 0
     }
 
+    #[inline]
     pub fn swap_if_transposed<T: Transpose>(self, value: T) -> T {
         if self.is_transposed() {
             value.transposed()

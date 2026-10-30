@@ -179,19 +179,10 @@ impl<T> Vec2<T> {
             y: &mut self.y,
         }
     }
-
-    #[inline]
-    pub fn as_tuple(self) -> (T, T) {
-        (self.x, self.y)
-    }
-
-    #[inline]
-    pub fn from_tuple((x, y): (T, T)) -> Self {
-        Self::new(x, y)
-    }
 }
 
 impl<T> Transpose for Vec2<T> {
+    #[inline]
     fn transposed(self) -> Self {
         Self::new(self.y, self.x)
     }

@@ -1,4 +1,4 @@
-use core::ops::{Range, Sub};
+use core::{ops::Sub, range::Range};
 
 use num_traits::AsPrimitive;
 
@@ -7,6 +7,10 @@ mod sealed {
 }
 
 pub trait RangeExt<T>: sealed::Sealed {
+    fn len(self) -> T::Output
+    where
+        T: Sub;
+
     fn map_ends<U>(self, f: impl FnMut(T) -> U) -> Range<U>;
 
     fn cast<U: Copy + 'static>(self) -> Range<U>
@@ -19,7 +23,7 @@ pub trait RangeExt<T>: sealed::Sealed {
 
     fn sub_from(self, value: T) -> Range<T::Output>
     where
-        T: Clone + Sub;
+        T: Copy + Sub;
 
     fn sub<U: Copy>(self, value: U) -> Range<T::Output>
     where
@@ -29,8 +33,15 @@ pub trait RangeExt<T>: sealed::Sealed {
 impl<T> sealed::Sealed for Range<T> {}
 
 impl<T> RangeExt<T> for Range<T> {
+    fn len(self) -> T::Output
+    where
+        T: Sub,
+    {
+        self.end - self.start
+    }
+
     fn map_ends<U>(self, mut f: impl FnMut(T) -> U) -> Range<U> {
-        f(self.start)..f(self.end)
+        (f(self.start)..f(self.end)).into()
     }
 
     fn cast<U: Copy + 'static>(self) -> Range<U>
@@ -47,20 +58,24 @@ impl<T> RangeExt<T> for Range<T> {
         let start = self.start.max(other.start);
         let end = self.end.min(other.end);
 
-        if start < end { Some(start..end) } else { None }
+        if start < end {
+            Some((start..end).into())
+        } else {
+            None
+        }
     }
 
     fn sub_from(self, value: T) -> Range<T::Output>
     where
-        T: Clone + Sub,
+        T: Copy + Sub,
     {
-        value.clone() - self.end..value - self.start
+        (value - self.end..value - self.start).into()
     }
 
     fn sub<U: Copy>(self, value: U) -> Range<T::Output>
     where
         T: Sub<U>,
     {
-        self.start - value..self.end - value
+        self.map_ends(|e| e - value)
     }
 }
