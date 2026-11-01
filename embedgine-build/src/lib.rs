@@ -11,8 +11,8 @@ use std::{
 };
 
 use convert_case::{Case, Casing};
-use embedgine_formats::{Alpha, Pixel, Rgba8, RowStart, Span, SpanKind};
-use image::{GenericImageView, ImageError, ImageReader, Pixel as _};
+use embedgine_formats::{Alpha, PackedPixelArray, Pixel, Rgba8, RowStart, Span, SpanKind};
+use image::{DynamicImage, GenericImageView, ImageError, ImageReader, Pixel as _};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Ident;
@@ -49,7 +49,6 @@ pub enum EntryKind {
         alpha_path: Option<PathBuf>,
         alpha: Alpha,
         width: u16,
-        pixels_len: usize,
         spans: Vec<Span>,
         row_starts: Vec<RowStart>,
     },
@@ -65,7 +64,6 @@ impl EntryKind {
                 alpha_path,
                 alpha,
                 width,
-                pixels_len,
                 spans,
                 row_starts,
             } => {
@@ -111,13 +109,9 @@ impl EntryKind {
                 let alpha = format_ident!("{alpha:?}");
                 quote! {
                     pub const #name: embedgine::Image<'static, Px, embedgine::formats::#alpha> = {
-                        const DATA: &Aligned<Px, [u8; #pixels_len * std::mem::size_of::<Px>()]> = &Aligned {
-                            _align: [],
-                            bytes: *include_bytes!(#px_path)
-                        };
                         embedgine::Image::new(
                             #width,
-                            unsafe { core::slice::from_raw_parts(DATA.bytes.as_ptr().cast(), #pixels_len) },
+                            unsafe { embedgine::formats::cast_bytes(include_bytes!(#px_path)) },
                             #alphas,
                             &[#(#spans),*],
                             &[#(#row_starts),*],
@@ -129,7 +123,6 @@ impl EntryKind {
                 let body = module.to_tokens();
                 quote! {
                     pub mod #name {
-                        use super::*;
                         #body
                     }
                 }
@@ -180,11 +173,6 @@ impl Module {
         let body = self.to_tokens();
         let format = Px::FORMAT;
         let file = quote! {
-            #[repr(C)]
-            struct Aligned<A, B: ?Sized> {
-                _align: [A; 0],
-                bytes: B,
-            }
             const _: () = {
                 const fn bytes_equal(lhs: &[u8], rhs: &[u8]) -> bool {
                     if lhs.len() != rhs.len() {
@@ -445,46 +433,22 @@ impl<'a, Px> Builder<'a, Px> {
         let image = ImageReader::open(entry.path())?
             .decode()
             .map_err(|e| Error::Image(entry.path().to_path_buf(), e))?;
-        let (width, height) = image.dimensions();
-        let pixel_count = width as usize * height as usize;
-        let mut pixels = Vec::with_capacity(pixel_count);
-        let mut alphas = Vec::with_capacity(pixel_count);
-        let mut alpha_kind = Alpha::Opaque;
-        let mut spans: Vec<Span> = Vec::new();
-        let mut row_starts = Vec::new();
-        for y in 0..height {
-            for x in 0..width {
-                let color = Rgba8::from_values(image.get_pixel(x, y).to_rgba().0);
-                let kind = SpanKind::from_alpha(color.a);
-                let alpha: Alpha = kind.into();
-                alpha_kind = alpha_kind.max(alpha);
-                if x == 0 {
-                    row_starts.push(RowStart {
-                        px_idx: pixels.len() as u32,
-                        alpha_idx: alphas.len() as u32,
-                        span_idx: spans.len() as u16,
-                    });
-                }
-                if x == 0 || spans.last().is_none_or(|s| Alpha::from(s.kind) != alpha) {
-                    spans.push(Span { len: 0, kind });
-                }
-                let span = spans.last_mut().unwrap();
-                span.len += 1;
-                if kind == SpanKind::Blended {
-                    alphas.push(color.a);
-                }
-                if kind != SpanKind::Transparent {
-                    pixels.push(Px::from(color.into()));
-                }
-            }
-        }
+        let EncodedImage {
+            pixels,
+            alphas,
+            alpha: alpha_kind,
+            width,
+            spans,
+            row_starts,
+        } = encode_image::<Px>(&image);
         let relative_path = entry.path().strip_prefix(assets_path).unwrap();
         let base_out_path = out_dir.join(relative_path);
         let px_path = base_out_path.with_added_extension("px.bin");
         if let Some(parent) = px_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&px_path, bytemuck::cast_slice(&pixels))?;
+        let packed = Px::Array::pack(&pixels);
+        fs::write(&px_path, &packed)?;
         let alpha_path = if !alphas.is_empty() {
             let path = base_out_path.with_extension("alpha.bin");
             fs::write(&path, &alphas)?;
@@ -499,8 +463,7 @@ impl<'a, Px> Builder<'a, Px> {
                 px_path,
                 alpha_path,
                 alpha: alpha_kind,
-                width: width as u16,
-                pixels_len: pixels.len(),
+                width,
                 spans,
                 row_starts,
             },
@@ -508,6 +471,247 @@ impl<'a, Px> Builder<'a, Px> {
     }
 }
 
+struct EncodedImage<Px> {
+    pixels: Vec<Px>,
+    alphas: Vec<u8>,
+    alpha: Alpha,
+    width: u16,
+    spans: Vec<Span>,
+    row_starts: Vec<RowStart>,
+}
+
+fn encode_image<Px: Pixel>(image: &DynamicImage) -> EncodedImage<Px> {
+    let (width, height) = image.dimensions();
+    let pixel_count = width as usize * height as usize;
+    let mut pixels = Vec::with_capacity(pixel_count);
+    let mut alphas = Vec::with_capacity(pixel_count);
+    let mut alpha_kind = Alpha::Opaque;
+    let mut spans: Vec<Span> = Vec::new();
+    let mut row_starts = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let color = Rgba8::from_values(image.get_pixel(x, y).to_rgba().0);
+            let kind = SpanKind::from_alpha(color.a);
+            let alpha: Alpha = kind.into();
+            alpha_kind = alpha_kind.max(alpha);
+            if x == 0 {
+                row_starts.push(RowStart {
+                    px_idx: pixels.len() as u32,
+                    alpha_idx: alphas.len() as u32,
+                    span_idx: spans.len() as u16,
+                });
+            }
+            if x == 0 || spans.last().is_none_or(|s| Alpha::from(s.kind) != alpha) {
+                spans.push(Span { len: 0, kind });
+            }
+            let span = spans.last_mut().unwrap();
+            span.len += 1;
+            if kind == SpanKind::Blended {
+                alphas.push(color.a);
+            }
+            if kind != SpanKind::Transparent {
+                pixels.push(Px::from(color.into()));
+            }
+        }
+    }
+    EncodedImage {
+        pixels,
+        alphas,
+        alpha: alpha_kind,
+        width: width as u16,
+        spans,
+        row_starts,
+    }
+}
+
 pub fn build<Px: Pixel>(assets_path: impl AsRef<Path>) -> Result<(), Error> {
     Builder::<Px>::new().build(assets_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use embedgine_formats::Rgb888;
+    use image::{Rgba, RgbaImage};
+
+    use super::*;
+
+    const T: [u8; 4] = [0, 0, 0, 0];
+
+    fn solid(v: u8) -> [u8; 4] {
+        [v, v, v, 255]
+    }
+
+    fn translucent(v: u8, a: u8) -> [u8; 4] {
+        [v, v, v, a]
+    }
+
+    fn encode(rows: &[&[[u8; 4]]]) -> EncodedImage<Rgb888> {
+        let image = RgbaImage::from_fn(rows[0].len() as u32, rows.len() as u32, |x, y| {
+            Rgba(rows[y as usize][x as usize])
+        });
+        encode_image(&DynamicImage::ImageRgba8(image))
+    }
+
+    fn spans(e: &EncodedImage<Rgb888>) -> Vec<(u16, SpanKind)> {
+        e.spans.iter().map(|s| (s.len, s.kind)).collect()
+    }
+
+    fn rows(e: &EncodedImage<Rgb888>) -> Vec<(u32, u32, u16)> {
+        e.row_starts
+            .iter()
+            .map(|r| (r.px_idx, r.alpha_idx, r.span_idx))
+            .collect()
+    }
+
+    fn reds(e: &EncodedImage<Rgb888>) -> Vec<u8> {
+        e.pixels.iter().map(|p| p.r).collect()
+    }
+
+    #[test]
+    fn opaque_image_has_one_span_per_row() {
+        let e = encode(&[&[solid(1), solid(2)], &[solid(3), solid(4)]]);
+        assert_eq!(e.alpha, Alpha::Opaque);
+        assert_eq!(e.width, 2);
+        assert_eq!(reds(&e), [1, 2, 3, 4]);
+        assert!(e.alphas.is_empty());
+        assert_eq!(spans(&e), [(2, SpanKind::Opaque), (2, SpanKind::Opaque)]);
+        assert_eq!(rows(&e), [(0, 0, 0), (2, 0, 1)]);
+    }
+
+    #[test]
+    fn transparent_pixels_store_no_data() {
+        let e = encode(&[&[T, solid(1), solid(2), T], &[solid(3), T, T, solid(4)]]);
+        assert_eq!(e.alpha, Alpha::Masked);
+        assert_eq!(reds(&e), [1, 2, 3, 4]);
+        assert!(e.alphas.is_empty());
+        assert_eq!(
+            spans(&e),
+            [
+                (1, SpanKind::Transparent),
+                (2, SpanKind::Opaque),
+                (1, SpanKind::Transparent),
+                (1, SpanKind::Opaque),
+                (2, SpanKind::Transparent),
+                (1, SpanKind::Opaque),
+            ]
+        );
+        assert_eq!(rows(&e), [(0, 0, 0), (2, 0, 3)]);
+    }
+
+    #[test]
+    fn alphas_are_stored_only_for_blended_spans() {
+        let e = encode(&[
+            &[translucent(1, 10), translucent(2, 20), solid(3)],
+            &[T, solid(4), translucent(5, 30)],
+        ]);
+        assert_eq!(e.alpha, Alpha::Blended);
+        assert_eq!(reds(&e), [1, 2, 3, 4, 5]);
+        assert_eq!(e.alphas, [10, 20, 30]);
+        assert_eq!(
+            spans(&e),
+            [
+                (2, SpanKind::Blended),
+                (1, SpanKind::Opaque),
+                (1, SpanKind::Transparent),
+                (1, SpanKind::Opaque),
+                (1, SpanKind::Blended),
+            ]
+        );
+        assert_eq!(rows(&e), [(0, 0, 0), (3, 2, 2)]);
+    }
+
+    #[test]
+    fn identical_kinds_do_not_merge_across_rows() {
+        let e = encode(&[&[T, T], &[T, T]]);
+        assert_eq!(e.alpha, Alpha::Masked);
+        assert!(e.pixels.is_empty());
+        assert_eq!(
+            spans(&e),
+            [(2, SpanKind::Transparent), (2, SpanKind::Transparent)]
+        );
+    }
+
+    #[test]
+    fn alpha_kind_does_not_depend_on_pixel_order() {
+        assert_eq!(encode(&[&[translucent(1, 9), T]]).alpha, Alpha::Blended);
+        assert_eq!(encode(&[&[T, translucent(1, 9)]]).alpha, Alpha::Blended);
+    }
+
+    fn image_entry() -> EntryKind {
+        EntryKind::Image {
+            px_path: "px.bin".into(),
+            alpha_path: Some("alpha.bin".into()),
+            alpha: Alpha::Blended,
+            width: 1,
+            spans: vec![Span {
+                len: 1,
+                kind: SpanKind::Blended,
+            }],
+            row_starts: vec![RowStart {
+                px_idx: 0,
+                alpha_idx: 0,
+                span_idx: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn generated_code_is_no_std_compatible() {
+        let mut nested = Module::default();
+        nested
+            .insert(
+                "INNER".into(),
+                Entry::new("inner.png".into(), image_entry()),
+            )
+            .unwrap();
+        let mut root = Module::default();
+        root.insert(
+            "OUTER".into(),
+            Entry::new("outer.png".into(), image_entry()),
+        )
+        .unwrap();
+        root.insert(
+            "nested".into(),
+            Entry::new("nested".into(), EntryKind::Module(nested)),
+        )
+        .unwrap();
+
+        let generated = root.generate::<Rgb888>();
+
+        assert!(generated.contains("pub const OUTER"), "{generated}");
+        assert!(generated.contains("pub mod nested"), "{generated}");
+        assert!(generated.contains("pub const INNER"), "{generated}");
+        assert!(!generated.contains("std::"), "{generated}");
+    }
+
+    #[test]
+    fn duplicate_module_entries_are_rejected() {
+        let mut module = Module::default();
+        module
+            .insert("A".into(), Entry::new("a.png".into(), image_entry()))
+            .unwrap();
+        let err = module
+            .insert("A".into(), Entry::new("a.bmp".into(), image_entry()))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Collision(path, key) if path == Path::new("a.bmp") && key == "A")
+        );
+    }
+
+    #[test]
+    fn matchers() {
+        let png = Path::new("a/b.png");
+        let bmp = Path::new("a/b.bmp");
+        assert!(Ext("png").matches(png));
+        assert!(!Ext("png").matches(bmp));
+        assert!(!Ext("png").matches(Path::new("png")));
+
+        let any = AnyOf::new([Ext("png"), Ext("bmp")]);
+        assert!(any.matches(png) && any.matches(bmp));
+        assert!(!any.matches(Path::new("a/b.gif")));
+
+        let all = AllOf::new([Ext("png"), Ext("bmp")]);
+        assert!(!all.matches(png));
+        assert!(AllOf::new([Ext("png")]).matches(png));
+    }
 }

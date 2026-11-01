@@ -11,3 +11,4 @@ pastey = "0.2.3"
 [features]
 default = ["embedded-graphics"]
 embedded-graphics = ["dep:embedded-graphics-core"]
+alloc = []
