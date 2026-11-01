@@ -447,7 +447,7 @@ impl<'a, Px> Builder<'a, Px> {
         if let Some(parent) = px_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let packed = Px::Array::pack(&pixels);
+        let packed = Px::Array::pack(pixels);
         fs::write(&px_path, &packed)?;
         let alpha_path = if !alphas.is_empty() {
             let path = base_out_path.with_extension("alpha.bin");

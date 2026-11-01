@@ -135,16 +135,20 @@ pub trait PixelArray<T> {
 
 pub trait PackedPixelArray<T>: PixelArray<T> + sealed::PodSlice {
     #[cfg(feature = "alloc")]
-    fn pack(pixels: &[T]) -> alloc::vec::Vec<u8>;
+    fn pack(pixels: alloc::vec::Vec<T>) -> alloc::vec::Vec<u8>;
+}
+
+const fn assert_pixel_byte_align<W>() {
+    assert!(
+        core::mem::align_of::<W>() == 1,
+        "pixel storage must have alignment 1",
+    );
 }
 
 #[doc(hidden)]
 pub const unsafe fn cast_bytes<W: bytemuck::Pod>(bytes: &[u8]) -> &[W] {
     let size = core::mem::size_of::<W>();
-    assert!(
-        core::mem::align_of::<W>() == 1,
-        "pixel storage must have alignment 1",
-    );
+    assert_pixel_byte_align::<W>();
     assert!(
         size != 0 && bytes.len().is_multiple_of(size),
         "length is not a whole number of words",
@@ -196,8 +200,9 @@ impl<T: Copy> PixelArray<T> for [T] {
 impl<T: bytemuck::Pod> PackedPixelArray<T> for [T] {
     #[cfg(feature = "alloc")]
     #[inline]
-    fn pack(pixels: &[T]) -> alloc::vec::Vec<u8> {
-        bytemuck::cast_slice(pixels).into()
+    fn pack(pixels: alloc::vec::Vec<T>) -> alloc::vec::Vec<u8> {
+        assert_pixel_byte_align::<T>();
+        bytemuck::cast_vec(pixels)
     }
 }
 
@@ -434,7 +439,7 @@ impl PixelArray<BinaryColor> for [u8] {
 
 impl PackedPixelArray<BinaryColor> for [u8] {
     #[cfg(feature = "alloc")]
-    fn pack(pixels: &[BinaryColor]) -> alloc::vec::Vec<u8> {
+    fn pack(pixels: alloc::vec::Vec<BinaryColor>) -> alloc::vec::Vec<u8> {
         let mut buf = BinaryColor::packed_vec(pixels.len());
         for (i, &p) in pixels.iter().enumerate() {
             if p.is_on() {

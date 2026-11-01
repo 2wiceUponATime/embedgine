@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 convert_case = "0.12.0"
-embedgine-formats = { version = "0.1.0", path = "../embedgine-formats" }
+embedgine-formats = { version = "0.1.0", path = "../embedgine-formats", features = [
+  "alloc",
+] }
 image = "0.25.10"
 prettyplease = "0.3.0"
 proc-macro2 = "1.0.107"
