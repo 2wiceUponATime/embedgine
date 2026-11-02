@@ -368,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "embedded-graphics-core",
+ "num-traits",
  "pastey 0.2.3",
 ]
 

@@ -5,8 +5,6 @@ use embedded_graphics_core::{
 };
 use num_traits::AsPrimitive;
 
-use crate::Transpose;
-
 mod private {
     pub trait Sealed {}
 }
@@ -56,7 +54,6 @@ macro_rules! int_widths {
         )+
     };
     (@ty $name:ident, $other:ident) => {
-        //type $name: Copy + Add<Output = Self::$name> + Sub<Output = Self::$name>;
         int_widths!(@ty $name, $other, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, Not);
     };
     (@ty $name:ident, $other:ident, $($trait:ident),+) => {
@@ -72,6 +69,17 @@ int_widths!(
     W128(i128, u128),
     WSize(isize, usize),
 );
+
+pub trait Transpose {
+    fn transposed(self) -> Self;
+}
+
+impl<T> Transpose for (T, T) {
+    #[inline]
+    fn transposed(self) -> Self {
+        (self.1, self.0)
+    }
+}
 
 macro_rules! impl_vec2_ops {
     {
@@ -126,7 +134,7 @@ pub struct Vec2<T> {
 }
 
 impl<T> Vec2<T> {
-    pub fn new(x: T, y: T) -> Self {
+    pub const fn new(x: T, y: T) -> Self {
         Self { x, y }
     }
 

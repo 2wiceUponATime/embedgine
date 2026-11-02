@@ -1,7 +1,8 @@
 use embedded_graphics::{geometry::Size, pixelcolor};
 use embedded_graphics_simulator::{SimulatorDisplay, Window};
 use embedgine::{
-    Canvas, DrawTargetSink, Renderer, Transform, formats::embedded_graphics::Rgb565Le as Px,
+    Canvas, DrawTargetSink, Renderer, Transform,
+    formats::{ArrayBuffer, embedded_graphics::Rgb565Le as Px},
     geometry::Vec2,
 };
 
@@ -14,6 +15,7 @@ mod assets {
 
 const WIDTH: u16 = 160;
 const HEIGHT: u16 = 128;
+const SIZE: Vec2<u16> = Vec2::new(WIDTH, HEIGHT);
 
 #[tokio::main]
 async fn main() {
@@ -21,7 +23,8 @@ async fn main() {
         SimulatorDisplay::<pixelcolor::Rgb565>::new(Size::new(WIDTH as u32, HEIGHT as u32));
     let mut sink = DrawTargetSink::<Px, _>::new(display);
 
-    let mut renderer: Renderer<Px, _> = Renderer::with_size(Vec2::new(WIDTH, HEIGHT), 4);
+    let mut renderer: Renderer<Px, _> =
+        Renderer::new(SIZE, 4, std::array::repeat(ArrayBuffer::with_size(SIZE)));
 
     renderer
         .render(

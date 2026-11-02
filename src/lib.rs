@@ -11,9 +11,10 @@ use core::{
 
 #[cfg(feature = "embedded-graphics")]
 use embedded_graphics_core::draw_target::DrawTarget;
-pub use embedgine_formats as formats;
+pub use embedgine_formats::{self as formats, geometry};
 use embedgine_formats::{
-    Blend, Blended, Masked, Opaque, PixelArray, RowStart, SpanKind, WritablePixelArray,
+    ArrayBuffer, Blend, Blended, Dir, Masked, Opaque, PixelArray, PixelBuffer, RowStart, SpanKind,
+    forward_pixel_array, geometry::Transpose,
 };
 use formats::{Alpha, AlphaKind, Pixel, Span};
 
@@ -24,7 +25,6 @@ use crate::{
 };
 
 mod array_cursor;
-pub mod geometry;
 mod range_ext;
 #[cfg(all(test, feature = "embedded-graphics"))]
 mod tests;
@@ -92,7 +92,7 @@ pub trait FrameSink {
     type Px: Pixel;
     type Error;
 
-    fn present<B: WritablePixelArray<Self::Px>>(
+    fn present<B: PixelBuffer<Self::Px>>(
         &mut self,
         size: Vec2<u16>,
         region: URect<W16>,
@@ -131,7 +131,7 @@ impl<Px: Pixel, T: DrawTarget<Color: From<Px>>> FrameSink for DrawTargetSink<Px,
     type Px = Px;
     type Error = T::Error;
 
-    async fn present<B: WritablePixelArray<Px>>(
+    async fn present<B: PixelBuffer<Px>>(
         &mut self,
         size: Vec2<u16>,
         region: URect<W16>,
@@ -139,7 +139,7 @@ impl<Px: Pixel, T: DrawTarget<Color: From<Px>>> FrameSink for DrawTargetSink<Px,
     ) -> Result<(), Self::Error> {
         assert_eq!(self.target.bounding_box().size, size.cast().into());
         let colors = (region.top()..region.bottom()).flat_map(|y| {
-            (region.left()..region.right()).map(move |x| canvas.read(Vec2::new(x, y)).into())
+            (region.left()..region.right()).map(move |x| canvas.read_pos(Vec2::new(x, y)).into())
         });
         self.target.fill_contiguous(&region.cast().into(), colors)
     }
@@ -196,7 +196,7 @@ impl<Px, B> Renderer<Px, B> {
         sink: &mut S,
     ) -> Result<(), S::Error>
     where
-        B: WritablePixelArray<Px>,
+        B: PixelBuffer<Px>,
     {
         let size = self.size;
         let mut canvas_idx = 0;
@@ -224,13 +224,9 @@ impl<Px, B> Renderer<Px, B> {
 }
 
 #[cfg(feature = "alloc")]
-impl<Px: Clone + Default> Renderer<Px, alloc::vec::Vec<Px>> {
-    fn buffers(width: u16, band_height: u16) -> [alloc::vec::Vec<Px>; 2] {
-        let buffer_len = width as usize * band_height as usize;
-        [
-            alloc::vec![Px::default(); buffer_len],
-            alloc::vec![Px::default(); buffer_len],
-        ]
+impl<Px: Clone + Default> Renderer<Px, ArrayBuffer<alloc::vec::Vec<Px>>> {
+    fn buffers(width: u16, band_height: u16) -> [ArrayBuffer<alloc::vec::Vec<Px>>; 2] {
+        core::array::from_fn(|_| ArrayBuffer::with_size(Vec2::new(width, band_height)))
     }
 
     pub fn with_size(size: Vec2<u16>, band_height: u16) -> Self {
@@ -239,81 +235,6 @@ impl<Px: Clone + Default> Renderer<Px, alloc::vec::Vec<Px>> {
 
     pub fn resize_alloc(&mut self, size: Vec2<u16>, band_height: u16) {
         self.resize(size, band_height, Self::buffers(size.x, band_height));
-    }
-}
-
-fn copy_iter<T: Copy>(
-    iter: impl Iterator<Item = (usize, T)>,
-    dst: &mut impl WritablePixelArray<T>,
-) {
-    for (i, s) in iter {
-        dst.write(i, s);
-    }
-}
-
-fn blend_iter<Px: Copy, K: DrawAlpha<Px>>(
-    iter: impl Iterator<Item = (usize, (Px, u8))>,
-    dst: &mut impl WritablePixelArray<Px>,
-) {
-    for (i, (s, alpha)) in iter {
-        dst.write(i, K::blend(dst.read(i), s, alpha));
-    }
-}
-
-fn write_pixels<Px: Copy>(
-    buf: &mut impl WritablePixelArray<Px>,
-    start: usize,
-    step: u16,
-    flipped: bool,
-    len: usize,
-    src: impl Iterator<Item = Px>,
-) {
-    match step {
-        1 => {
-            if flipped {
-                copy_iter((start..start + len).rev().zip(src), buf);
-            } else {
-                buf.write_from(start, src);
-            }
-        }
-        s => {
-            let indices = (0..len).map(|i| start + i * (s as usize));
-            if flipped {
-                copy_iter(indices.rev().zip(src), buf);
-            } else {
-                copy_iter(indices.zip(src), buf);
-            }
-        }
-    }
-}
-
-fn blend_pixels<Px: Copy, K: DrawAlpha<Px>>(
-    buf: &mut impl WritablePixelArray<Px>,
-    start: usize,
-    step: u16,
-    flipped: bool,
-    len: usize,
-    src: impl Iterator<Item = Px>,
-    alphas: &[u8],
-) {
-    match step {
-        1 => {
-            let indices = start..start + len;
-            if flipped {
-                blend_iter::<Px, K>(indices.rev().zip(src.zip(alphas.iter().copied())), buf);
-            } else {
-                buf.update_from(start, src, |i, dst, src| K::blend(dst, src, alphas[i]));
-            }
-        }
-        s => {
-            let zipped = src.zip(alphas.iter().copied());
-            let iter = (0..len).map(|i| start + i * (s as usize));
-            if flipped {
-                blend_iter::<Px, K>(iter.rev().zip(zipped), buf);
-            } else {
-                blend_iter::<Px, K>(iter.zip(zipped), buf);
-            }
-        }
     }
 }
 
@@ -379,14 +300,16 @@ impl<Px, B> Canvas<Px, B> {
         self.band
     }
 
-    fn buffer_index(&self, Vec2 { x, y }: Vec2<u16>) -> usize {
-        (y - self.band.start) as usize * self.size.x as usize + x as usize
+    fn buffer_pos(&self, pos: Vec2<u16>) -> Vec2<u16> {
+        Vec2::new(pos.x, pos.y - self.band.start)
     }
 }
 
-impl<Px: Pixel, B: WritablePixelArray<Px>> Canvas<Px, B> {
+impl<Px: Pixel, B: PixelBuffer<Px>> Canvas<Px, B> {
     pub fn fill(&mut self, color: Px) {
-        self.buffer.write_from(0, core::iter::repeat(color));
+        for y in self.band {
+            self.write_from(Vec2::new(0, y), Dir::X, core::iter::repeat(color));
+        }
     }
 
     pub fn draw_image<K: DrawAlpha<Px>>(
@@ -396,12 +319,12 @@ impl<Px: Pixel, B: WritablePixelArray<Px>> Canvas<Px, B> {
         transform: Transform,
     ) {
         let out_size = transform.swap_if_transposed(image.size());
-        let step = if transform.is_transposed() {
-            self.width()
-        } else {
-            1
+        let dir = match (transform.is_transposed(), transform.src_reversed().x) {
+            (true, true) => Dir::YRev,
+            (true, false) => Dir::Y,
+            (false, true) => Dir::XRev,
+            (false, false) => Dir::X,
         };
-        let flipped = transform.src_reversed().x;
         let Some(out_x) = Range::from(0..self.width() as i16)
             .intersection((pos.x..pos.x + out_size.x as i16).into())
         else {
@@ -432,15 +355,20 @@ impl<Px: Pixel, B: WritablePixelArray<Px>> Canvas<Px, B> {
                     if transform.src_reversed().y {
                         y = in_y.len() as usize - 1 - y;
                     }
-                    let dst = transform.swap_if_transposed(Vec2::new(0, y as u16))
+                    let mut dst = transform.swap_if_transposed(Vec2::new(0, y as u16))
                         + Vec2::new(out_x.start, out_y.start).cast::<u16>();
+                    // A reversed run starts from the far end and walks back.
+                    match dir {
+                        Dir::XRev => dst.x = out_x.end as u16 - 1,
+                        Dir::YRev => dst.y = out_y.end as u16 - 1,
+                        Dir::X | Dir::Y => {}
+                    }
                     let row_range = in_x.cast::<usize>();
                     let src = image
                         .pixels
                         .pixels_from(px.step(span.len).start + row_range.start)
                         .take(row_range.len());
-                    let start = self.buffer_index(dst);
-                    write_pixels(&mut self.buffer, start, step, flipped, row_range.len(), src);
+                    self.write_from(dst, dir, src);
                 }
             }
             Alpha::Masked | Alpha::Blended => {
@@ -491,28 +419,14 @@ impl<Px: Pixel, B: WritablePixelArray<Px>> Canvas<Px, B> {
                             .pixels
                             .pixels_from(px_range.start + span_offset.start)
                             .take(span_offset.len());
-                        let first = if flipped { range.end - 1 } else { range.start };
-                        let start = self.buffer_index(map(first, src_y));
+                        let dst = map(range.start, src_y);
                         if span.kind == SpanKind::Blended {
                             let alphas = &image.alphas[alpha_range][span_offset];
-                            blend_pixels::<Px, K>(
-                                &mut self.buffer,
-                                start,
-                                step,
-                                flipped,
-                                span_offset.len(),
-                                src,
-                                alphas,
-                            );
+                            self.update_from(dst, dir, src, |i, dst, src| {
+                                K::blend(dst, src, alphas[i])
+                            });
                         } else {
-                            write_pixels(
-                                &mut self.buffer,
-                                start,
-                                step,
-                                flipped,
-                                span_offset.len(),
-                                src,
-                            );
+                            self.write_from(dst, dir, src);
                         }
                     }
                 }
@@ -521,24 +435,31 @@ impl<Px: Pixel, B: WritablePixelArray<Px>> Canvas<Px, B> {
     }
 }
 
-impl<Px, B: WritablePixelArray<Px>> Canvas<Px, B> {
-    pub fn read(&self, pos: Vec2<u16>) -> Px {
-        self.buffer.read(self.buffer_index(pos))
-    }
-
-    pub fn write(&mut self, pos: Vec2<u16>, value: Px) {
-        self.buffer.write(self.buffer_index(pos), value);
-    }
+forward_pixel_array! {
+    impl[Px, B: PixelArray<Px>] PixelArray<Px> for Canvas<Px, B> => |s| &s.buffer;
 }
 
-pub trait Transpose {
-    fn transposed(self) -> Self;
-}
-
-impl<T> Transpose for (T, T) {
+/// Positions are absolute screen coordinates; only rows inside the band are addressable.
+impl<Px, B: PixelBuffer<Px>> PixelBuffer<Px> for Canvas<Px, B> {
     #[inline]
-    fn transposed(self) -> Self {
-        (self.1, self.0)
+    fn capacity(&self) -> Vec2<u16> {
+        self.size
+    }
+
+    #[inline]
+    fn contains_pos(&self, pos: Vec2<u16>) -> bool {
+        pos.x < self.size.x && self.band.contains(&pos.y)
+    }
+
+    #[inline]
+    fn read_pos(&self, pos: Vec2<u16>) -> Px {
+        self.buffer.read_pos(self.buffer_pos(pos))
+    }
+
+    #[inline]
+    fn write(&mut self, pos: Vec2<u16>, value: Px) {
+        let pos = self.buffer_pos(pos);
+        self.buffer.write(pos, value);
     }
 }
 

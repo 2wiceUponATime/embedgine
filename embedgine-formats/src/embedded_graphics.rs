@@ -24,122 +24,122 @@ impl From<pixelcolor::Rgb888> for Rgb888 {
 }
 
 macro_rules! rgb {
-        ($($ty:ident),* $(,)?) => {
-            $(pastey::paste! {
-                rgb!(@endian [<$ty Le>], pixelcolor::$ty, le);
-                rgb!(@endian [<$ty Be>], pixelcolor::$ty, be);
-            })*
-        };
-        (@endian $ty:ident, $pixel:ty, $endian:ident) => {
-            pastey::paste! {
-                #[derive(Clone, Copy, Default, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
-                #[repr(transparent)]
-                pub struct $ty(<$pixel as ToBytes>::Bytes);
+    ($($ty:ident),* $(,)?) => {
+        $(pastey::paste! {
+            rgb!(@endian [<$ty Le>], pixelcolor::$ty, le);
+            rgb!(@endian [<$ty Be>], pixelcolor::$ty, be);
+        })*
+    };
+    (@endian $ty:ident, $pixel:ty, $endian:ident) => {
+        pastey::paste! {
+            #[derive(Clone, Copy, Default, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
+            #[repr(transparent)]
+            pub struct $ty(<$pixel as ToBytes>::Bytes);
 
-                impl $ty {
-                    pub fn new(r: u8, g: u8, b: u8) -> Self {
-                        Self($pixel::new(r, g, b).[<to_ $endian _bytes>]())
-                    }
-
-                    pub fn from_rgb8(r: u8, g: u8, b: u8) -> Self {
-                        let inner: $pixel = pixelcolor::Rgb888::new(r, g, b).into();
-                        Self(inner.[<to_ $endian _bytes>]())
-                    }
-
-                    pub fn r(&self) -> u8 {
-                        $pixel::from(self).r()
-                    }
-
-                    pub fn g(&self) -> u8 {
-                        $pixel::from(self).g()
-                    }
-
-                    pub fn b(&self) -> u8 {
-                        $pixel::from(self).b()
-                    }
+            impl $ty {
+                pub fn new(r: u8, g: u8, b: u8) -> Self {
+                    Self($pixel::new(r, g, b).[<to_ $endian _bytes>]())
                 }
 
-                rgb!(@colors $ty, $pixel, black, red, green, blue, cyan, magenta, yellow, white);
-
-                impl Debug for $ty {
-                    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                        write!(f, "{}({}, {}, {})", stringify!([<$ty:lower>]), self.r(), self.g(), self.b())
-                    }
+                pub fn from_rgb8(r: u8, g: u8, b: u8) -> Self {
+                    let inner: $pixel = pixelcolor::Rgb888::new(r, g, b).into();
+                    Self(inner.[<to_ $endian _bytes>]())
                 }
 
-                impl From<Rgb888> for $ty {
-                    fn from(Rgb888 { r, g, b }: Rgb888) -> Self {
-                        Self::from_rgb8(r, g, b)
-                    }
+                pub fn r(&self) -> u8 {
+                    $pixel::from(self).r()
                 }
 
-                impl From<&$ty> for $pixel {
-                    fn from(value: &$ty) -> Self {
-                        type Raw = <$pixel as PixelColor>::Raw;
-                        type Storage = <Raw as RawData>::Storage;
-                        const STORAGE_SIZE: usize = core::mem::size_of::<Storage>();
-                        let mut bytes = [0u8; STORAGE_SIZE];
-                        match stringify!($endian) {
-                            "le" => &mut bytes[..value.0.len()],
-                            "be" => &mut bytes[STORAGE_SIZE - value.0.len()..],
-                            _ => unreachable!(),
-                        }
-                        .copy_from_slice(&value.0);
-                        $pixel::from(Raw::new(Storage::[<from_ $endian _bytes>](bytes)))
-                    }
+                pub fn g(&self) -> u8 {
+                    $pixel::from(self).g()
                 }
 
-                impl From<$ty> for $pixel {
-                    fn from(value: $ty) -> Self {
-                        $pixel::from(&value)
-                    }
-                }
-
-                impl From<&$pixel> for $ty {
-                    fn from(value: &$pixel) -> Self {
-                        Self(value.[<to_ $endian _bytes>]())
-                    }
-                }
-
-                impl From<$pixel> for $ty {
-                    fn from(value: $pixel) -> Self {
-                        $ty::from(&value)
-                    }
-                }
-
-                impl From<$ty> for Rgb888 {
-                    fn from(value: $ty) -> Self {
-                        pixelcolor::Rgb888::from($pixel::from(value)).into()
-                    }
-                }
-
-                impl Pixel for $ty {
-                    type Array = [Self];
-
-                    const FORMAT: &'static str = stringify!([<$ty:lower>]);
-                }
-
-                impl Blend for $ty {
-                    fn blend(self, src: Self, alpha: u8) -> Self {
-                        Self::new(
-                            mix(self.r(), src.r(), alpha),
-                            mix(self.g(), src.g(), alpha),
-                            mix(self.b(), src.b(), alpha),
-                        )
-                    }
+                pub fn b(&self) -> u8 {
+                    $pixel::from(self).b()
                 }
             }
-        };
-        (@colors $ty:ident, $pixel:ty, $($color:ident),+) => {
-            pastey::paste! {
-                impl $ty {
-                    $(pub fn $color() -> Self {
-                        $pixel::[<$color:upper>].into()
-                    })+
+
+            rgb!(@colors $ty, $pixel, black, red, green, blue, cyan, magenta, yellow, white);
+
+            impl Debug for $ty {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    write!(f, "{}({}, {}, {})", stringify!([<$ty:lower>]), self.r(), self.g(), self.b())
                 }
             }
-        };
-    }
+
+            impl From<Rgb888> for $ty {
+                fn from(Rgb888 { r, g, b }: Rgb888) -> Self {
+                    Self::from_rgb8(r, g, b)
+                }
+            }
+
+            impl From<&$ty> for $pixel {
+                fn from(value: &$ty) -> Self {
+                    type Raw = <$pixel as PixelColor>::Raw;
+                    type Storage = <Raw as RawData>::Storage;
+                    const STORAGE_SIZE: usize = core::mem::size_of::<Storage>();
+                    let mut bytes = [0u8; STORAGE_SIZE];
+                    match stringify!($endian) {
+                        "le" => &mut bytes[..value.0.len()],
+                        "be" => &mut bytes[STORAGE_SIZE - value.0.len()..],
+                        _ => unreachable!(),
+                    }
+                    .copy_from_slice(&value.0);
+                    $pixel::from(Raw::new(Storage::[<from_ $endian _bytes>](bytes)))
+                }
+            }
+
+            impl From<$ty> for $pixel {
+                fn from(value: $ty) -> Self {
+                    $pixel::from(&value)
+                }
+            }
+
+            impl From<&$pixel> for $ty {
+                fn from(value: &$pixel) -> Self {
+                    Self(value.[<to_ $endian _bytes>]())
+                }
+            }
+
+            impl From<$pixel> for $ty {
+                fn from(value: $pixel) -> Self {
+                    $ty::from(&value)
+                }
+            }
+
+            impl From<$ty> for Rgb888 {
+                fn from(value: $ty) -> Self {
+                    pixelcolor::Rgb888::from($pixel::from(value)).into()
+                }
+            }
+
+            impl Pixel for $ty {
+                type Array = [Self];
+
+                const FORMAT: &'static str = stringify!([<$ty:lower>]);
+            }
+
+            impl Blend for $ty {
+                fn blend(self, src: Self, alpha: u8) -> Self {
+                    Self::new(
+                        mix(self.r(), src.r(), alpha),
+                        mix(self.g(), src.g(), alpha),
+                        mix(self.b(), src.b(), alpha),
+                    )
+                }
+            }
+        }
+    };
+    (@colors $ty:ident, $pixel:ty, $($color:ident),+) => {
+        pastey::paste! {
+            impl $ty {
+                $(pub fn $color() -> Self {
+                    $pixel::[<$color:upper>].into()
+                })+
+            }
+        }
+    };
+}
 
 rgb!(Rgb555, Bgr555, Rgb565, Bgr565, Rgb666, Bgr666);
 

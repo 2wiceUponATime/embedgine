@@ -13,9 +13,15 @@ use embedded_graphics_core::{
 
 use super::*;
 use crate::{
-    formats::{BinaryColor, embedded_graphics::Rgb565Le as Px},
+    formats::{ArrayBuffer, BinaryBuffer, BinaryColor, Lsb0, embedded_graphics::Rgb565Le as Px},
     geometry::Rect,
 };
+
+type Buf = ArrayBuffer<Vec<Px>>;
+
+fn buf(width: u16, pixels: Vec<Px>) -> Buf {
+    ArrayBuffer::new(pixels, width)
+}
 
 const TRANSFORMS: [Transform; 8] = [
     Transform::Identity,
@@ -192,12 +198,12 @@ fn banded_frame<K: DrawAlpha<Px>>(
     transform: Transform,
 ) -> Vec<Px> {
     let mut frame = Vec::with_capacity(w as usize * h as usize);
-    for band in Renderer::<Px, Vec<Px>>::bands(h, band_height) {
+    for band in Renderer::<Px, Buf>::bands(h, band_height) {
         let len = w as usize * band.len() as usize;
-        let mut canvas = Canvas::new(Vec2::new(w, h), band, vec![bg(); len]);
+        let mut canvas = Canvas::new(Vec2::new(w, h), band, buf(w, vec![bg(); len]));
         canvas.draw_image(image, pos, transform);
         for y in band.start..band.end {
-            frame.extend((0..w).map(|x| canvas.read(Vec2::new(x, y))));
+            frame.extend((0..w).map(|x| canvas.read_pos(Vec2::new(x, y))));
         }
     }
     frame
@@ -273,9 +279,9 @@ fn letters() -> Sprite {
 
 fn drawn<K: DrawAlpha<Px>>(sprite: &Sprite, size: (u16, u16), t: Transform) -> Vec<Px> {
     let buffer = vec![bg(); size.0 as usize * size.1 as usize];
-    let mut canvas = Canvas::full(Vec2::new(size.0, size.1), buffer);
+    let mut canvas = Canvas::full(Vec2::new(size.0, size.1), buf(size.0, buffer));
     canvas.draw_image(&sprite.image::<K>(), Vec2::new(0, 0), t);
-    canvas.buffer
+    canvas.buffer.storage
 }
 
 #[test]
@@ -326,13 +332,13 @@ fn clipping_at_each_edge() {
         (0, 3, &["....", "....", "....", "abc."]),
     ];
     for (x, y, rows) in cases {
-        let mut canvas = Canvas::full(Vec2::new(4, 4), vec![bg(); 16]);
+        let mut canvas = Canvas::full(Vec2::new(4, 4), buf(4, vec![bg(); 16]));
         canvas.draw_image(
             &sprite.image::<Opaque>(),
             Vec2::new(x, y),
             Transform::Identity,
         );
-        assert_eq!(canvas.buffer, grid(rows), "({x}, {y})");
+        assert_eq!(canvas.buffer.storage, grid(rows), "({x}, {y})");
     }
 }
 
@@ -340,46 +346,46 @@ fn clipping_at_each_edge() {
 fn image_entirely_off_canvas_draws_nothing() {
     let sprite = letters();
     for (x, y) in [(-3, 0), (4, 0), (0, -2), (0, 4)] {
-        let mut canvas = Canvas::full(Vec2::new(4, 4), vec![bg(); 16]);
+        let mut canvas = Canvas::full(Vec2::new(4, 4), buf(4, vec![bg(); 16]));
         canvas.draw_image(
             &sprite.image::<Masked>(),
             Vec2::new(x, y),
             Transform::Identity,
         );
-        assert_eq!(canvas.buffer, vec![bg(); 16], "({x}, {y})");
+        assert_eq!(canvas.buffer.storage, vec![bg(); 16], "({x}, {y})");
     }
 }
 
 #[test]
 fn band_shows_only_its_slice_of_the_image() {
     let sprite = letters();
-    let mut canvas = Canvas::new(Vec2::new(3, 2), (1..2).into(), vec![bg(); 3]);
+    let mut canvas = Canvas::new(Vec2::new(3, 2), (1..2).into(), buf(3, vec![bg(); 3]));
     canvas.draw_image(
         &sprite.image::<Opaque>(),
         Vec2::new(0, 0),
         Transform::Identity,
     );
-    assert_eq!(canvas.buffer, grid(&["def"]));
+    assert_eq!(canvas.buffer.storage, grid(&["def"]));
 }
 
 #[test]
 fn blended_pixels_mix_with_the_canvas() {
     let sprite = Sprite::new(vec![vec![(Px::black(), 128)]]);
-    let mut canvas = Canvas::full(Vec2::new(1, 1), vec![Px::white()]);
+    let mut canvas = Canvas::full(Vec2::new(1, 1), buf(1, vec![Px::white()]));
     canvas.draw_image(
         &sprite.image::<Blended>(),
         Vec2::new(0, 0),
         Transform::Identity,
     );
     // White is (31, 63, 31) in 565. Black at alpha 128 leaves 127/255 of it.
-    assert_eq!(canvas.buffer, [Px::new(15, 31, 15)]);
+    assert_eq!(canvas.buffer.storage, [Px::new(15, 31, 15)]);
 }
 
 #[test]
 #[should_panic(expected = "Unexpected SpanKind::Blended")]
 fn blended_span_in_masked_image_panics() {
     let sprite = Sprite::from_rows(&[&[(1, 128)]]);
-    let mut canvas = Canvas::full(Vec2::new(1, 1), vec![bg()]);
+    let mut canvas = Canvas::full(Vec2::new(1, 1), buf(1, vec![bg()]));
     canvas.draw_image(
         &sprite.image::<Masked>(),
         Vec2::new(0, 0),
@@ -400,27 +406,51 @@ fn image_dimensions() {
 
 #[test]
 fn canvas_addresses_pixels_relative_to_its_band() {
-    let mut canvas = Canvas::new(Vec2::new(2, 4), (2..4).into(), vec![bg(); 4]);
+    let mut canvas = Canvas::new(Vec2::new(2, 4), (2..4).into(), buf(2, vec![bg(); 4]));
     canvas.write(Vec2::new(1, 3), color(1));
-    assert_eq!(canvas.read(Vec2::new(1, 3)), color(1));
-    assert_eq!(canvas.buffer[3], color(1));
+    assert_eq!(canvas.read_pos(Vec2::new(1, 3)), color(1));
+    assert_eq!(canvas.buffer.storage[3], color(1));
+    assert_eq!(canvas.capacity(), Vec2::new(2, 4));
+    assert!(canvas.contains_pos(Vec2::new(1, 2)));
+    assert!(!canvas.contains_pos(Vec2::new(1, 1)), "row above the band");
+    assert!(!canvas.contains_pos(Vec2::new(1, 4)), "row below the band");
+    assert!(
+        !canvas.contains_pos(Vec2::new(2, 2)),
+        "column past the width"
+    );
+}
+
+#[test]
+fn canvas_write_from_stops_at_the_band_edge() {
+    let mut canvas = Canvas::new(Vec2::new(2, 4), (1..3).into(), buf(2, vec![bg(); 4]));
+    canvas.write_from(Vec2::new(0, 0), Dir::Y, core::iter::repeat(color(1)));
+    assert_eq!(canvas.buffer.storage, vec![bg(); 4], "start above the band");
+    canvas.write_from(Vec2::new(1, 1), Dir::Y, core::iter::repeat(color(2)));
+    canvas.write_from(Vec2::new(0, 2), Dir::YRev, core::iter::repeat(color(3)));
+    assert_eq!(
+        canvas.buffer.storage,
+        [color(3), color(2), color(3), color(2)]
+    );
 }
 
 #[test]
 fn canvas_fill_covers_the_whole_buffer() {
-    let mut canvas = Canvas::new(Vec2::new(2, 4), (2..4).into(), vec![bg(); 4]);
+    let mut canvas = Canvas::new(Vec2::new(2, 4), (2..4).into(), buf(2, vec![bg(); 4]));
     canvas.fill(color(1));
-    assert_eq!(canvas.buffer, vec![color(1); 4]);
+    assert_eq!(canvas.buffer.storage, vec![color(1); 4]);
 }
 
 #[test]
 fn canvas_over_packed_binary_buffer() {
-    let mut canvas = Canvas::full(Vec2::new(3, 3), BinaryColor::packed_vec(9));
+    let buffer = BinaryBuffer::<_, Lsb0>::new(BinaryColor::packed_vec(9), 3, false);
+    let mut canvas = Canvas::full(Vec2::new(3, 3), buffer);
     canvas.fill(BinaryColor::ON);
     canvas.write(Vec2::new(1, 1), BinaryColor::OFF);
-    assert_eq!(canvas.read(Vec2::new(0, 0)), BinaryColor::ON);
-    assert_eq!(canvas.read(Vec2::new(1, 1)), BinaryColor::OFF);
-    assert_eq!(canvas.read(Vec2::new(2, 2)), BinaryColor::ON);
+    assert_eq!(canvas.read_pos(Vec2::new(0, 0)), BinaryColor::ON);
+    assert_eq!(canvas.read_pos(Vec2::new(1, 1)), BinaryColor::OFF);
+    assert_eq!(canvas.read_pos(Vec2::new(2, 2)), BinaryColor::ON);
+    // Fill sets exactly the nine visible pixels, not the spare bits of the last byte.
+    assert_eq!(canvas.buffer.storage, [0b1110_1111, 0b0000_0001]);
 }
 
 #[test]
@@ -542,7 +572,7 @@ impl FrameSink for RecordingSink {
     type Px = Px;
     type Error = usize;
 
-    async fn present<B: WritablePixelArray<Px>>(
+    async fn present<B: PixelBuffer<Px>>(
         &mut self,
         size: Vec2<u16>,
         region: URect<W16>,
@@ -555,29 +585,29 @@ impl FrameSink for RecordingSink {
         }
         let pixels = (region.top()..region.bottom())
             .flat_map(|y| (region.left()..region.right()).map(move |x| (x, y)))
-            .map(|(x, y)| canvas.read(Vec2::new(x, y)))
+            .map(|(x, y)| canvas.read_pos(Vec2::new(x, y)))
             .collect();
         self.frames.push((size, region, pixels));
         Ok(())
     }
 }
 
-fn renderer(size: (u16, u16), band_height: u16) -> Renderer<Px, Vec<Px>> {
+fn renderer(size: (u16, u16), band_height: u16) -> Renderer<Px, Buf> {
     let len = size.0 as usize * band_height as usize;
     Renderer::new(
         Vec2::new(size.0, size.1),
         band_height,
-        [vec![bg(); len], vec![bg(); len]],
+        [buf(size.0, vec![bg(); len]), buf(size.0, vec![bg(); len])],
     )
 }
 
-fn fill_by_band(canvas: &mut Canvas<Px, Vec<Px>>) {
+fn fill_by_band(canvas: &mut Canvas<Px, Buf>) {
     canvas.fill(color(canvas.band().start as u8 + 1));
 }
 
 #[test]
 fn bands_cover_the_height_with_a_shorter_final_band() {
-    let bands = |h, b| Renderer::<Px, Vec<Px>>::bands(h, b).collect::<Vec<_>>();
+    let bands = |h, b| Renderer::<Px, Buf>::bands(h, b).collect::<Vec<_>>();
     assert_eq!(bands(5, 2), [(0..2).into(), (2..4).into(), (4..5).into()]);
     assert_eq!(bands(4, 2), [(0..2).into(), (2..4).into()]);
     assert_eq!(bands(2, 8), [(0..2).into()]);
@@ -607,7 +637,7 @@ fn render_stitches_an_image_across_bands() {
     let (pos, t) = (Vec2::new(1, -1), Transform::RotCw);
     let image = sprite.image::<Blended>();
     let mut sink = RecordingSink::default();
-    let draw = |canvas: &mut Canvas<Px, Vec<Px>>| {
+    let draw = |canvas: &mut Canvas<Px, Buf>| {
         canvas.fill(bg());
         canvas.draw_image(&image, pos, t);
     };
@@ -642,7 +672,11 @@ fn render_returns_the_error_from_the_final_band() {
 #[test]
 fn resize_updates_canvas_geometry() {
     let mut renderer = renderer((2, 2), 1);
-    renderer.resize(Vec2::new(4, 4), 2, [vec![bg(); 8], vec![bg(); 8]]);
+    renderer.resize(
+        Vec2::new(4, 4),
+        2,
+        [buf(4, vec![bg(); 8]), buf(4, vec![bg(); 8])],
+    );
     assert_eq!(renderer.size(), Vec2::new(4, 4));
     for canvas in &renderer.buffers {
         assert_eq!(canvas.size(), Vec2::new(4, 4));
@@ -653,14 +687,14 @@ fn resize_updates_canvas_geometry() {
 #[cfg(feature = "alloc")]
 #[test]
 fn allocating_constructors_size_buffers_for_one_band() {
-    let mut renderer = Renderer::<Px, Vec<Px>>::with_size(Vec2::new(3, 4), 2);
+    let mut renderer = Renderer::<Px, Buf>::with_size(Vec2::new(3, 4), 2);
     assert_eq!(renderer.size(), Vec2::new(3, 4));
-    assert_eq!(renderer.buffers[0].buffer.len(), 6);
+    assert_eq!(renderer.buffers[0].buffer.size(), Vec2::new(3, 2));
 
     renderer.resize_alloc(Vec2::new(5, 6), 3);
     assert_eq!(renderer.size(), Vec2::new(5, 6));
     for canvas in renderer.into_inner() {
-        assert_eq!(canvas.buffer.len(), 15);
+        assert_eq!(canvas.buffer.size(), Vec2::new(5, 3));
     }
 }
 
